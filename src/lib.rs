@@ -1,4 +1,4 @@
-//! Crash-consistent keyed blob streaming on trusted local filesystems.
+//! Interruption-resistant keyed blob streaming on trusted local filesystems.
 //!
 //! The store accepts opaque key and payload bytes. [`BlockingAtomicBlobStore`]
 //! and the feature-gated async `tokio::AtomicBlobStore` facade use one
@@ -8,18 +8,35 @@
 //!
 //! # Platform and filesystem scope
 //!
-//! This implementation supports Unix and Windows. Other targets compile, but
-//! opening a store returns [`AtomicBlobStoreError::UnsupportedPlatform`]. It is
-//! intended for ordinary local filesystems; it does not detect or certify NFS,
-//! SMB, container volumes, virtual disks, filesystem or mount behavior,
-//! controller caches, or persistence under arbitrary power loss.
+//! This implementation runs on Unix and Windows. Other targets compile, but
+//! opening a store returns [`AtomicBlobStoreError::UnsupportedPlatform`]. Its
+//! filesystem guarantees are limited to the native filesystems and test
+//! environments described below; successful operation on another filesystem
+//! does not certify that filesystem's interruption or durability behavior.
 //!
 //! A successful save means the platform backend synchronized its staging file
-//! and completed an atomic replacement of the canonical path. Unix uses
-//! `atomic-write-file` and synchronizes the containing directory; Windows uses
-//! exclusive native staging plus a write-through move. These observable
-//! operations establish canonical-path old-or-new process-interruption
-//! semantics, not a universal hardware power-loss guarantee.
+//! and completed its same-directory replacement operation. Unix uses
+//! `atomic-write-file`. Windows uses an exclusively created staging file,
+//! `FlushFileBuffers`, and `MoveFileExW` with write-through flags, followed by a
+//! namespace-directory flush that must succeed for the operation to report
+//! success.
+//!
+//! On native local filesystems with rename semantics matching the tested
+//! environments, this design is intended to provide complete old-or-new
+//! canonical-path visibility under process interruption. Windows interruption
+//! evidence currently covers local NTFS and termination immediately before and
+//! after the replacement call; atomicity while interruption overlaps the Win32
+//! call is an engineering expectation, not an explicit universal Win32 or
+//! cross-filesystem guarantee. ReFS, FAT/exFAT, SMB, cloud-backed directories,
+//! container or virtual volumes, and other filesystems are not certified.
+//!
+//! Flush and write-through calls request persistence from the operating system
+//! and storage stack. They cannot guarantee survival under arbitrary power
+//! loss, controller or device caches that ignore flush requests, filesystem
+//! defects, or virtual-storage behavior. Windows does not document the
+//! directory flush used here as a portable equivalent of Unix directory
+//! `fsync`; it is an additional checked operation, not the basis of the
+//! old-or-new visibility expectation.
 //!
 //! # Trust and concurrency model
 //!
@@ -41,6 +58,12 @@
 //! CRC32C detects accidental corruption only. The store provides no encryption,
 //! authentication, cryptographic integrity, or tamper resistance. Corruption
 //! fails closed and is left untouched.
+//!
+//! Errors do not always imply that the namespace is unchanged. An atomic commit
+//! error is ambiguous and requires a reload. A save can also fail while
+//! synchronizing the namespace after the complete replacement is already
+//! canonical; clear can fail after its rename has already made the canonical
+//! path absent. Callers that need the resulting state must inspect or reload.
 //!
 //! Only the canonical configured-suffix path is authoritative. Windows cleanup
 //! recognizes only store-owned staging names; Unix never parses

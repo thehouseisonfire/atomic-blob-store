@@ -12,6 +12,41 @@ The migration starts only after the fork has satisfied [`PLAN.md`](PLAN.md),
 published version `0.1.0`, and demonstrated the Windows behavior in
 [`CONTRACT.md`](CONTRACT.md).
 
+## Feasibility and contract cautions
+
+The migration is feasible because the current complete and streaming save
+paths already share the abstraction the fork provides: the store owns envelope
+encoding and streams bytes into a same-directory writer, while the atomic-file
+layer owns staging synchronization and replacement. It is not a safe dependency
+substitution unless the fork first provides explicit staging names and detailed
+commit outcomes.
+
+Treat the following as migration gates rather than optional cleanup:
+
+- Preserve the exact Windows save staging name. It is documented format and is
+  recognized by the public stale-cleanup operation.
+- Preserve the staging path after failures whose replacement outcome is
+  unknown. Cleanup must not erase evidence or cause the store to report a
+  definitely-uncommitted result incorrectly.
+- Close every staging handle before replacement. The store currently does not
+  clone these handles; the migration must not introduce clones that can turn
+  commit into a sharing violation.
+- Keep clear, quarantine, cleanup, timestamp refresh, and namespace-directory
+  synchronization in this crate. They are not atomic-writer responsibilities.
+- Do not strengthen the public Windows guarantee merely because replacement
+  moved behind a dependency. The defensible evidence remains local NTFS native
+  testing, and `MoveFileExW` does not document universal atomic replacement for
+  all Windows filesystems and interruption modes.
+- Keep the Windows directory flush as a checked store-level operation only.
+  Do not describe it as a documented equivalent of Unix directory `fsync` or
+  make the fork's atomicity contract depend on it.
+- Preserve conservative public error behavior: callers must reload after any
+  atomic commit error even if the fork can internally classify some failures as
+  definitely not committed.
+
+Migration acceptance includes the stronger tests in [`TODO.md`](TODO.md), not
+only the current before/after replacement interruption hooks.
+
 ## Preserved behavior
 
 The migration must not change:
@@ -125,7 +160,9 @@ native paths.
    Windows saves use `atomic-write-file-xplat`, with Windows using its native
    exclusive staging and write-through replacement backend.
 2. Keep the current old-or-new process-interruption language and hardware,
-   network-filesystem, reparse-point, and cross-process limitations.
+   network-filesystem, reparse-point, and cross-process limitations, but qualify
+   Windows behavior as a local-NTFS test-backed engineering expectation rather
+   than a universal Win32 guarantee.
 3. Keep `FORMAT.md` staging names unchanged. Clarify that the store supplies the
    Windows save staging component through the fork's explicit-name API, while
    Unix temporary names remain dependency-owned and unparsed.
@@ -176,4 +213,3 @@ Migration is complete only when all existing tests and package checks pass,
 new dependency-specific regressions pass, immutable fixtures are unchanged,
 and a diff review confirms that no public feature or documented Windows staging
 behavior was accidentally removed.
-

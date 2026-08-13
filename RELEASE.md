@@ -15,6 +15,15 @@ and require both the pinned `windows-2022` and compatibility
 `windows-latest` jobs, including extracted-package consumers, to pass without
 ignored failures.
 
+Windows release evidence must record that the actual test root is on a local
+NTFS volume. Passing on another filesystem is useful compatibility evidence but
+does not substantiate the documented interruption contract. Until the items in
+[`TODO.md`](TODO.md) are complete, describe old-or-new behavior during an
+interruption overlapping `MoveFileExW` as an engineering expectation rather
+than a directly exercised guarantee. A successful Windows namespace-directory
+flush must not be represented as a documented equivalent of Unix directory
+`fsync`.
+
 Before publication, maintainers must still explicitly accept compatibility,
 security-response, documentation, CI, and release-cadence ownership. The
 public API and V1 format must also receive feedback from an external,

@@ -14,9 +14,9 @@
 </div>
 
 `atomic-blob-store` saves one size-limited byte blob per opaque key on a trusted
-local Unix or Windows filesystem. It supports atomic streaming save, validated
-streaming load, complete-blob conveniences, metadata inspection, quarantine,
-clear, and explicit maintenance.
+local Unix or Windows filesystem. It supports interruption-resistant streaming
+save, validated streaming load, complete-blob conveniences, metadata
+inspection, quarantine, clear, and explicit maintenance.
 
 This crate is not a database, queue, object service, log, cache-coherence
 protocol, or multi-process coordination mechanism.
@@ -71,26 +71,50 @@ occupies one configured concurrent-operation slot and applies backpressure.
 caller cancellation may leave caller-owned output partially written, but
 invalid envelopes produce no output.
 
-## Trust and durability
+## Platform, trust, and durability
 
 The configured root and its ancestors are trusted and application-controlled.
 The crate does not defend against hostile path replacement, symlinks, reparse
 points, another writer, network filesystems, or storage hardware that violates
 filesystem synchronization semantics.
 
+The crate runs on Unix and Windows, but successful operation is not a
+certification of every filesystem accepted by those operating systems. The
+Windows contract is tested on local NTFS. ReFS, FAT/exFAT, SMB shares,
+cloud-backed directories, container or virtual volumes, and other filesystems
+are best-effort and have no claimed interruption or durability guarantee.
+
 CRC32C detects accidental corruption only. There is no authentication,
 encryption, tamper resistance, compare-and-swap, transaction support, locking,
 lease, fencing, or cross-process guarantee.
 
-Successful replacement provides an old-or-new complete canonical file under
-process interruption. Successful clear provides an old-or-absent state.
-Hardware power-loss behavior still depends on the operating system,
-filesystem, device, controller, and mount configuration.
+The implementation writes and flushes a complete same-directory staging file
+before invoking the platform replacement primitive. On native local
+filesystems whose rename behavior matches the tested environments, this is
+intended to provide a complete old-or-new canonical file under process
+interruption; clear is correspondingly intended to provide old-or-absent.
+
+On Windows, native tests currently terminate processes immediately before and
+after `MoveFileExW`. They substantiate the surrounding state transitions but
+do not prove behavior when termination overlaps the syscall itself. Old-or-new
+visibility during that narrow window is an engineering expectation based on
+local NTFS rename behavior, not an explicit universal Win32 guarantee.
+
+Flush and write-through calls request persistence but cannot guarantee survival
+under arbitrary power loss or storage that ignores those requests. The Windows
+namespace-directory flush is a checked additional operation; Windows does not
+document it as a portable equivalent of Unix directory `fsync`.
 
 An atomic commit error is ambiguous: the old complete blob or new complete blob
 may be canonical. Reload to determine the observable state. Corrupt,
 wrong-domain, future-version, oversized, truncated, and trailing-data envelopes
 fail closed and are not modified or automatically quarantined.
+
+A save can also return a namespace-synchronization error after replacement has
+already made the complete new blob canonical. Likewise, clear can report a
+post-rename synchronization or temporary-file removal error after the canonical
+path is already absent. Callers must inspect or reload after these errors rather
+than infer state solely from the result.
 
 Quarantine also has an explicit post-rename ambiguity: namespace
 synchronization can fail after the canonical path has already moved. In that
@@ -100,11 +124,13 @@ canonical path is absent and the complete prior blob remains at that path.
 Unix uses `atomic-write-file` for same-directory replacement and synchronizes
 directories after namespace creation and clear. Dependency-owned temporary
 names are never parsed or cleaned by this crate. Windows uses exclusive
-same-directory staging files and native write-through moves; its explicit
-cleanup recognizes only names owned by the configured suffix and store format.
-Native Windows CI exercises failure and process-interruption boundaries,
-extended and non-Unicode paths where the hosted filesystem permits them, both
-facades, and independently extracted package consumers.
+same-directory staging files, `FlushFileBuffers`, and native write-through
+moves; its explicit cleanup recognizes only names owned by the configured
+suffix and store format. Native Windows CI exercises failure boundaries,
+process termination immediately around namespace operations, extended and
+non-Unicode paths where the hosted filesystem permits them, both facades, and
+independently extracted package consumers. See [TODO.md](TODO.md) for the
+additional evidence required to exercise interruption overlapping replacement.
 
 See [FORMAT.md](FORMAT.md) for the byte-level stable format and compatibility
 policy and [RELEASE.md](RELEASE.md) for the independent release-readiness
