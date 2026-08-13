@@ -1,0 +1,159 @@
+# Plan for the `atomic-write-file-xplat` fork
+
+## Objective
+
+Create `atomic-write-file-xplat` as an explicitly identified, independently
+maintained fork of `atomic-write-file` 0.3.1. Preserve upstream Unix and WASI
+behavior, replace the generic Windows implementation with a reviewed native
+backend, and publish a reusable crate whose Windows behavior satisfies
+[`CONTRACT.md`](CONTRACT.md).
+
+The first independent release is `0.1.0`. The package name is
+`atomic-write-file-xplat`; consumers may rename the dependency in `Cargo.toml`
+if they want to retain the `atomic_write_file` import in existing source.
+
+## 1. Establish the fork
+
+1. Fork the upstream repository at the `0.3.1` release tag, retaining Git
+   history where practical.
+2. Rename the Cargo package, repository metadata, badges, documentation links,
+   and release artifacts to `atomic-write-file-xplat`.
+3. Set the independent version to `0.1.0` and retain Rust 2024 with an MSRV of
+   Rust 1.85 or newer.
+4. Preserve the upstream BSD-3-Clause license, copyright notice, contributor
+   history, and changelog. Add a prominent README section stating that the
+   project is an independent fork of Andrea Corbellini's
+   `atomic-write-file`, identifying upstream 0.3.1 as its baseline.
+5. Record the reasons for the fork: upstream is intentionally feature-stable,
+   while this project needs a specified and natively tested Windows backend.
+   Do not imply endorsement by the upstream maintainer.
+6. Copy `CONTRACT.md` into the fork and link it from the crate-level docs and
+   README as the normative Windows contract.
+
+Exit criterion: package metadata, licensing, attribution, repository naming,
+and documentation consistently identify an independent fork, and
+`cargo package --list` contains all required license and contract files.
+
+## 2. Preserve upstream behavior
+
+1. Import the upstream 0.3.1 source, tests, feature flags, Unix implementations,
+   WASI/generic behavior, examples, and crash-test harness without semantic
+   changes.
+2. Keep `AtomicWriteFile`, `OpenOptions`, `Directory`, the standard I/O trait
+   implementations, `commit`, and `discard` source-compatible. Document the
+   Windows contract's one semantic restriction: cloned staging handles must be
+   closed before commit because staging is exclusive.
+3. Keep platform selection target-based. Do not add `windows`, `unix`, or
+   `wasi` Cargo features.
+4. Run upstream tests on Linux, macOS, Windows, and WASI before adding the new
+   backend, recording any baseline failures separately from fork changes.
+
+Exit criterion: existing upstream examples compile after changing only the
+dependency package/import name, and Unix/WASI behavior has no intentional
+regression.
+
+## 3. Add the reusable API extensions
+
+1. Add public `CommitOutcome::{NotCommitted, Unknown}` and a public
+   `CommitError` that owns the underlying `io::Error`, outcome, and staging
+   path. Provide accessor methods, `Display`, `Error::source`, and conversion to
+   `io::Error`.
+2. Add `AtomicWriteFile::commit_detailed(self) -> Result<(), CommitError>`.
+   Implement the existing `commit() -> io::Result<()>` by calling the detailed
+   method and converting its error without losing the downcastable source.
+3. Add
+   `OpenOptions::open_with_temporary_name(&self, destination, temporary_name)`.
+   Validate that the name is one non-empty normal component and create it in
+   exactly the destination's directory. Reject absolute paths, prefixes,
+   separators, `.` and `..` before attempting filesystem mutation.
+4. Make both default and explicit staging paths available to detailed commit
+   failures. Keep default temporary names compatible with upstream unless a
+   platform requirement forces a documented change.
+5. Audit finalization state so a failed pre-commit flush is reported as
+   `NotCommitted`, Drop remains safe, and cleanup does not erase diagnostic
+   state needed to understand an unknown outcome.
+6. Document compatibility behavior, including how callers using only
+   `commit()` see an ordinary `io::Error` and how advanced callers recover the
+   detailed error.
+
+Exit criterion: old source usage remains valid, explicit staging names cannot
+escape the destination directory, and every commit error carries a tested
+outcome classification.
+
+## 4. Implement the native Windows backend
+
+1. Add a `cfg(windows)` implementation instead of routing Windows through the
+   generic backend. Add `windows-sys` only under the Windows target with the
+   minimum required Foundation, Security, and FileSystem features.
+2. Implement UTF-16 extended-path conversion without lossy string conversion.
+   Preserve device/verbatim prefixes, translate local and UNC paths correctly,
+   and NUL-terminate buffers passed to Win32.
+3. Create staging files using `CreateFileW`, `CREATE_NEW`, no sharing,
+   `FILE_FLAG_WRITE_THROUGH`, and read access only when requested. Retry only
+   collisions generated by the default name generator; surface collisions for
+   explicit names.
+4. On commit, flush the staging handle with `FlushFileBuffers`, close it, and
+   invoke `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING |
+   MOVEFILE_WRITE_THROUGH`. Never enable cross-volume copy fallback.
+5. Implement discard and Drop cleanup using native deletion with precise Win32
+   error conversion.
+6. Classify every error before `MoveFileExW` as `NotCommitted`. Maintain a small
+   reviewed allowlist of replacement errors that Win32 documents as leaving the
+   destination unchanged; classify every other replacement failure as
+   `Unknown`.
+7. Do not add directory flushing, metadata merging, automatic sharing-violation
+   retries, filesystem rejection, reparse-point defense, or cross-process
+   locking in this release.
+8. Add safety comments for every unsafe call and keep path and handle ownership
+   explicit so each handle closes exactly once on all return paths.
+
+Exit criterion: implementation review can map every statement in
+`CONTRACT.md` to code and a native test, with no undocumented durability claim.
+
+## 5. Test the contract
+
+Add unit and native integration coverage for:
+
+- creating a previously absent destination and replacing an existing file;
+- read, write, vectored I/O, seek, metadata access, and underlying file access;
+- default and explicit staging names, collisions, invalid names, discard, and
+  best-effort Drop cleanup;
+- process interruption during writing, before flush, before replacement, and
+  immediately after replacement, accepting only the contract's state table;
+- detailed error outcome, source, staging path, and compatibility conversion;
+- an old destination handle continuing to read old contents after commit and a
+  new open reading new contents;
+- incompatible sharing modes producing a visible sharing violation without an
+  implicit retry;
+- a cloned staging handle preventing commit until closed, as required by the
+  exclusive-staging contract;
+- relative, absolute, extended-length, UNC-local, and non-Unicode paths where
+  supported by the runner;
+- replacement of symlinks/reparse points according to the documented trust
+  boundary;
+- default non-preservation of destination metadata; and
+- no temporary-name collision between concurrent writers.
+
+The native atomicity and interruption suite must assert that its test volume is
+local NTFS. Tests on any other filesystem may exercise functionality but must
+not be accepted as contract evidence.
+
+## 6. CI and release gates
+
+1. Retain upstream Linux, macOS, WASI, feature-combination, Clippy, rustfmt,
+   documentation, and Linux crash-test jobs.
+2. Add required Windows jobs on `windows-2022` and a manually dispatched or
+   scheduled `windows-latest` compatibility job.
+3. Record Windows version, volume type, and relevant path capability in test
+   artifacts. Run interruption tests repeatedly to expose timing-dependent
+   failures.
+4. Add packaged downstream consumers for the default API and for
+   `commit_detailed` plus explicit staging names.
+5. Require `cargo check --locked --all-targets`, all tests, rustfmt, Clippy with
+   warnings denied, docs, license checks, and `cargo package` verification.
+6. Publish `0.1.0` only after all required jobs pass. Tag the exact commit and
+   use that released version for the `atomic-blob-store` migration.
+
+Release acceptance requires native NTFS old-or-new interruption evidence,
+source-compatible upstream examples, successful packaged consumers, and no
+regression in upstream Unix or WASI tests.
