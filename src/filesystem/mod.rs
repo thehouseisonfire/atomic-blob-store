@@ -533,6 +533,10 @@ pub(crate) fn sync_windows_directory(config: &StoreConfig) -> Result<(), io::Err
         FILE_SHARE_WRITE, FlushFileBuffers, OPEN_EXISTING,
     };
 
+    #[cfg(test)]
+    if let Some(hook) = &config.hook {
+        hook(TestStage::BeforeDirectoryOpen)?;
+    }
     let path = wide_path(&config.namespace);
     // SAFETY: `path` is NUL-terminated and the returned handle is checked before ownership is
     // transferred to `File`.
@@ -556,6 +560,10 @@ pub(crate) fn sync_windows_directory(config: &StoreConfig) -> Result<(), io::Err
     #[cfg(test)]
     if let Some(hook) = &config.hook {
         hook(TestStage::BeforeDirectorySync)?;
+    }
+    #[cfg(test)]
+    if let Some(hook) = &config.hook {
+        hook(TestStage::BeforeDirectoryFlush)?;
     }
     // SAFETY: `directory` owns a valid directory handle opened for synchronization.
     if unsafe { FlushFileBuffers(handle) } == 0 {
@@ -617,6 +625,12 @@ pub(crate) fn create_windows_staging(
                 source,
             })
     };
+    #[cfg(test)]
+    hit_test_stage(
+        _config,
+        TestStage::BeforeHeaderWrite,
+        StoreOperation::WriteEnvelope,
+    )?;
     write_section(header)?;
     #[cfg(test)]
     hit_test_stage(
@@ -624,9 +638,26 @@ pub(crate) fn create_windows_staging(
         TestStage::DuringWrite,
         StoreOperation::WriteEnvelope,
     )?;
-    for section in [payload, checksum] {
-        write_section(section)?;
-    }
+    #[cfg(test)]
+    hit_test_stage(
+        _config,
+        TestStage::BeforePayloadWrite,
+        StoreOperation::WriteEnvelope,
+    )?;
+    write_section(payload)?;
+    #[cfg(test)]
+    hit_test_stage(
+        _config,
+        TestStage::BeforeChecksumWrite,
+        StoreOperation::WriteEnvelope,
+    )?;
+    write_section(checksum)?;
+    #[cfg(test)]
+    hit_test_stage(
+        _config,
+        TestStage::BeforeStagingFlush,
+        StoreOperation::WriteEnvelope,
+    )?;
     // SAFETY: the file still owns a live handle.
     if unsafe { FlushFileBuffers(handle) } == 0 {
         return Err(AtomicBlobStoreError::Io {
@@ -678,6 +709,12 @@ pub(crate) fn create_windows_streaming_staging(
     // SAFETY: the successful CreateFileW call returned an owned handle.
     let mut file = unsafe { std::fs::File::from_raw_handle(handle) };
     write_stream_envelope(config, &mut file, declared_len, chunks)?;
+    #[cfg(test)]
+    hit_test_stage(
+        config,
+        TestStage::BeforeStagingFlush,
+        StoreOperation::WriteEnvelope,
+    )?;
     // SAFETY: the file still owns a live handle.
     if unsafe { FlushFileBuffers(handle) } == 0 {
         return Err(AtomicBlobStoreError::Io {
@@ -812,11 +849,21 @@ pub(crate) fn save_blob(
         {
             return Err(AtomicBlobStoreError::AtomicCommit { source });
         }
+        #[cfg(test)]
+        if let Some(hook) = &config.hook {
+            hook(TestStage::BeforeInitialMove)
+                .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
+        }
         let initial = move_file(&staging, path, MOVEFILE_WRITE_THROUGH);
         match initial {
             Ok(()) => {}
             Err(error) if matches!(error.raw_os_error(), Some(code) if (code as u32) == ERROR_FILE_EXISTS || (code as u32) == ERROR_ALREADY_EXISTS) =>
             {
+                #[cfg(test)]
+                if let Some(hook) = &config.hook {
+                    hook(TestStage::BeforeReplacingMove)
+                        .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
+                }
                 move_file(
                     &staging,
                     path,
@@ -901,11 +948,21 @@ pub(crate) fn save_blob_from_receiver(
         {
             return Err(AtomicBlobStoreError::AtomicCommit { source });
         }
+        #[cfg(test)]
+        if let Some(hook) = &config.hook {
+            hook(TestStage::BeforeInitialMove)
+                .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
+        }
         let initial = move_file(&staging, path, MOVEFILE_WRITE_THROUGH);
         match initial {
             Ok(()) => {}
             Err(error) if matches!(error.raw_os_error(), Some(code) if (code as u32) == ERROR_FILE_EXISTS || (code as u32) == ERROR_ALREADY_EXISTS) =>
             {
+                #[cfg(test)]
+                if let Some(hook) = &config.hook {
+                    hook(TestStage::BeforeReplacingMove)
+                        .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
+                }
                 move_file(
                     &staging,
                     path,

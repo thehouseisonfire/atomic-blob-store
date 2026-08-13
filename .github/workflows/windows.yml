@@ -8,6 +8,12 @@ on:
       - '**'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
+    inputs:
+      soak:
+        description: Run the 10,000-attempt release soak on windows-2022
+        required: false
+        default: false
+        type: boolean
 
 env:
   CARGO_INCREMENTAL: 0
@@ -18,7 +24,7 @@ jobs:
   native-windows:
     name: File store on ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -26,11 +32,12 @@ jobs:
     env:
       ATOMIC_BLOB_TEST_ARTIFACT_DIR: ${{ github.workspace }}/windows-validation/test-artifacts
       ATOMIC_BLOB_PACKAGE_EVIDENCE_DIR: ${{ github.workspace }}/windows-validation/package
+      ATOMIC_BLOB_REQUIRE_LOCAL_NTFS: 1
 
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: clippy
 
@@ -146,6 +153,25 @@ jobs:
               -p atomic-blob-store --all-features \
               -E 'binary(model_sequences)' --no-capture 2>&1 | tee -a "$log"
           done
+
+      - name: Run randomized replacement interruption evidence campaign
+        shell: bash
+        timeout-minutes: 150
+        env:
+          ATOMIC_BLOB_WINDOWS_STRESS_ATTEMPTS: ${{ github.event_name == 'workflow_dispatch' && inputs.soak && matrix.runner == 'windows-2022' && '10000' || '2000' }}
+          ATOMIC_BLOB_WINDOWS_STRESS_SEED: 6840335469060923678
+        run: |
+          set -euo pipefail
+          log="windows-validation/replacement-stress.log"
+          {
+            echo "attempts=${ATOMIC_BLOB_WINDOWS_STRESS_ATTEMPTS}"
+            echo "seed=${ATOMIC_BLOB_WINDOWS_STRESS_SEED}"
+            rustc -Vv
+            cargo -V
+          } | tee "$log"
+          cargo test --locked --release --all-features \
+            tests::windows_randomized_replacement_stress_exposes_only_complete_candidates \
+            -- --ignored --exact --nocapture 2>&1 | tee -a "$log"
 
       - name: Validate packaged blocking and Tokio consumers
         shell: bash

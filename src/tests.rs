@@ -2,6 +2,8 @@ use std::io::{Cursor, Read};
 use std::num::NonZeroUsize;
 
 use super::*;
+#[cfg(windows)]
+use crate::windows_test::{WindowsTestEnvironment, qualify_contract_test};
 use ::tokio;
 use ::tokio::io::{AsyncRead, AsyncWrite};
 use ::tokio::sync::oneshot;
@@ -1398,6 +1400,476 @@ fn windows_owned_staging(namespace: &Path, kind: &str, identifier: char) -> Path
 }
 
 #[cfg(windows)]
+fn windows_save_staging_files(namespace: &Path) -> Vec<PathBuf> {
+    let mut paths = std::fs::read_dir(namespace)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            is_owned_temporary_filename(&name.to_string_lossy(), ".blob")
+                && name.to_string_lossy().contains(".tmp-v1.save.")
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_complete_save_failures_have_phase_justified_states() {
+    let cases = [
+        (TestStage::BeforeAtomicOpen, false, false),
+        (TestStage::BeforeHeaderWrite, true, false),
+        (TestStage::BeforePayloadWrite, true, false),
+        (TestStage::BeforeChecksumWrite, true, false),
+        (TestStage::BeforeStagingFlush, true, true),
+        (TestStage::BeforeCommit, true, true),
+        (TestStage::BeforeInitialMove, true, true),
+        (TestStage::BeforeReplacingMove, true, true),
+    ];
+    for (failed_stage, staging_exists, staging_is_complete) in cases {
+        let root = test_directory();
+        if !qualify_contract_test(
+            root.path(),
+            &format!("deterministic-complete-save-{failed_stage:?}"),
+        )
+        .unwrap()
+        {
+            return;
+        }
+        let initial = AtomicBlobStore::open(root.path(), "failure-state", options())
+            .await
+            .unwrap();
+        initial.save(b"key", b"old".to_vec()).await.unwrap();
+        initial.close().await.unwrap();
+
+        let hook = Arc::new(move |stage| {
+            if stage == failed_stage {
+                Err(io::Error::other("injected native Windows failure"))
+            } else {
+                Ok(())
+            }
+        });
+        let store =
+            AtomicBlobStore::open_with_test_hook(root.path(), "failure-state", options(), hook)
+                .await
+                .unwrap();
+        let error = store.save(b"key", b"new".to_vec()).await.unwrap_err();
+        if matches!(
+            failed_stage,
+            TestStage::BeforeInitialMove | TestStage::BeforeReplacingMove
+        ) {
+            assert!(matches!(error, AtomicBlobStoreError::AtomicCommit { .. }));
+        } else {
+            assert!(matches!(error, AtomicBlobStoreError::Io { .. }));
+        }
+        assert_eq!(store.load(b"key").await.unwrap(), Some(b"old".to_vec()));
+
+        let staging = windows_save_staging_files(&root.path().join("failure-state"));
+        assert_eq!(
+            staging.len(),
+            usize::from(staging_exists),
+            "{failed_stage:?}"
+        );
+        if staging_is_complete {
+            let payload = decode_reader(
+                &format(),
+                &mut Cursor::new(std::fs::read(&staging[0]).unwrap()),
+                TEST_MAXIMUM,
+            )
+            .unwrap();
+            assert_eq!(payload, b"new", "{failed_stage:?}");
+        }
+        store.close().await.unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_streaming_save_failures_preserve_old_and_clean_or_own_staging() {
+    for failed_stage in [
+        TestStage::BeforeHeaderWrite,
+        TestStage::BeforePayloadWrite,
+        TestStage::BeforeChecksumWrite,
+        TestStage::BeforeStagingFlush,
+        TestStage::BeforeCommit,
+        TestStage::BeforeInitialMove,
+        TestStage::BeforeReplacingMove,
+    ] {
+        let root = test_directory();
+        if !qualify_contract_test(
+            root.path(),
+            &format!("deterministic-streaming-save-{failed_stage:?}"),
+        )
+        .unwrap()
+        {
+            return;
+        }
+        let initial = AtomicBlobStore::open(root.path(), "stream-state", options())
+            .await
+            .unwrap();
+        initial.save(b"key", b"old".to_vec()).await.unwrap();
+        initial.close().await.unwrap();
+        let hook = Arc::new(move |stage| {
+            if stage == failed_stage {
+                Err(io::Error::other("injected streaming native failure"))
+            } else {
+                Ok(())
+            }
+        });
+        let store =
+            AtomicBlobStore::open_with_test_hook(root.path(), "stream-state", options(), hook)
+                .await
+                .unwrap();
+        assert!(
+            store
+                .save_from(b"key", &mut Cursor::new(b"new"), 3)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.load(b"key").await.unwrap(), Some(b"old".to_vec()));
+        for staging in windows_save_staging_files(&root.path().join("stream-state")) {
+            assert!(staging.is_file());
+        }
+        store.close().await.unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_namespace_open_and_flush_errors_are_post_commit() {
+    for failed_stage in [
+        TestStage::BeforeDirectoryOpen,
+        TestStage::BeforeDirectoryFlush,
+    ] {
+        let root = test_directory();
+        if !qualify_contract_test(
+            root.path(),
+            &format!("post-commit-namespace-sync-{failed_stage:?}"),
+        )
+        .unwrap()
+        {
+            return;
+        }
+        let initial = AtomicBlobStore::open(root.path(), "namespace-sync", options())
+            .await
+            .unwrap();
+        initial.save(b"key", b"old".to_vec()).await.unwrap();
+        initial.close().await.unwrap();
+        let armed = Arc::new(AtomicBool::new(true));
+        let hook = {
+            let armed = Arc::clone(&armed);
+            Arc::new(move |stage| {
+                if stage == failed_stage && armed.swap(false, Ordering::SeqCst) {
+                    Err(io::Error::other(
+                        "injected namespace synchronization failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        let store =
+            AtomicBlobStore::open_with_test_hook(root.path(), "namespace-sync", options(), hook)
+                .await
+                .unwrap();
+        assert!(matches!(
+            store.save(b"key", b"new".to_vec()).await,
+            Err(AtomicBlobStoreError::Io {
+                operation: StoreOperation::SyncNamespaceDirectory,
+                ..
+            })
+        ));
+        drop(store);
+        let fresh = AtomicBlobStore::open(root.path(), "namespace-sync", options())
+            .await
+            .unwrap();
+        assert_eq!(fresh.load(b"key").await.unwrap(), Some(b"new".to_vec()));
+        fresh.close().await.unwrap();
+    }
+}
+
+#[cfg(windows)]
+fn windows_commit_raw_error(error: &AtomicBlobStoreError) -> Option<i32> {
+    match error {
+        AtomicBlobStoreError::AtomicCommit { source } => source.raw_os_error(),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_sharing_violation_returns_promptly_without_retry_and_is_cleanable() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let root = test_directory();
+    if !qualify_contract_test(root.path(), "sharing-violation").unwrap() {
+        return;
+    }
+    let store = AtomicBlobStore::open(root.path(), "sharing", options())
+        .await
+        .unwrap();
+    store.save(b"key", b"old".to_vec()).await.unwrap();
+    let canonical = store.blob_path(b"key");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&canonical)
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = store.save(b"key", b"new".to_vec()).await.unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        windows_commit_raw_error(&error),
+        Some(ERROR_SHARING_VIOLATION as i32)
+    );
+    drop(held);
+    assert_eq!(store.load(b"key").await.unwrap(), Some(b"old".to_vec()));
+
+    store.save(b"write-key", b"old".to_vec()).await.unwrap();
+    let held_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE)
+        .open(store.blob_path(b"write-key"))
+        .unwrap();
+    let write_error = store.save(b"write-key", b"new".to_vec()).await.unwrap_err();
+    assert_eq!(
+        windows_commit_raw_error(&write_error),
+        Some(ERROR_SHARING_VIOLATION as i32)
+    );
+    drop(held_writer);
+    assert_eq!(
+        store.load(b"write-key").await.unwrap(),
+        Some(b"old".to_vec())
+    );
+
+    let namespace = root.path().join("sharing");
+    let staging = windows_save_staging_files(&namespace);
+    assert_eq!(staging.len(), 2);
+    for path in &staging {
+        set_windows_modified(path, SystemTime::now() - Duration::from_secs(2 * 60 * 60));
+    }
+    let report = store
+        .cleanup_stale_temporary_files(Duration::from_secs(60 * 60))
+        .await
+        .unwrap();
+    assert_eq!(report.removed.len(), 2);
+    assert!(windows_save_staging_files(&namespace).is_empty());
+    store.close().await.unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_delete_shared_old_handle_and_fresh_open_see_distinct_file_objects() {
+    use std::io::{Seek, SeekFrom};
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let root = test_directory();
+    if !qualify_contract_test(root.path(), "delete-shared-old-handle").unwrap() {
+        return;
+    }
+    let store = AtomicBlobStore::open(root.path(), "open-handle", options())
+        .await
+        .unwrap();
+    store.save(b"key", b"old".to_vec()).await.unwrap();
+    let mut old_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(store.blob_path(b"key"))
+        .unwrap();
+    store.save(b"key", b"new".to_vec()).await.unwrap();
+
+    old_handle.seek(SeekFrom::Start(0)).unwrap();
+    assert_eq!(
+        decode_reader(&format(), &mut old_handle, TEST_MAXIMUM).unwrap(),
+        b"old"
+    );
+    assert_eq!(store.load(b"key").await.unwrap(), Some(b"new".to_vec()));
+    store.close().await.unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_independent_stores_are_valid_but_have_no_ordering_contract() {
+    let root = test_directory();
+    if !qualify_contract_test(root.path(), "independent-store-negative-contract").unwrap() {
+        return;
+    }
+    let left = AtomicBlobStore::open(root.path(), "independent", options())
+        .await
+        .unwrap();
+    let right = AtomicBlobStore::open(root.path(), "independent", options())
+        .await
+        .unwrap();
+    for iteration in 0_u8..64 {
+        let left_payload = vec![b'L', iteration];
+        let right_payload = vec![b'R', iteration];
+        let left_save = left.save(b"key", left_payload.clone());
+        let right_save = right.save(b"key", right_payload.clone());
+        let (left_result, right_result) = tokio::join!(left_save, right_save);
+        let observed = left.load(b"key").await.unwrap().unwrap();
+        assert!(observed == left_payload || observed == right_payload);
+        assert!(left_result.is_ok() || right_result.is_ok());
+    }
+    left.close().await.unwrap();
+    right.close().await.unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_external_writer_is_an_explicit_negative_contract_case() {
+    let root = test_directory();
+    let store = AtomicBlobStore::open(root.path(), "external-writer", options())
+        .await
+        .unwrap();
+    store.save(b"key", b"valid".to_vec()).await.unwrap();
+    std::fs::write(
+        store.blob_path(b"key"),
+        b"external writer bypassed the store",
+    )
+    .unwrap();
+    assert!(store.load(b"key").await.is_err());
+    assert_eq!(
+        std::fs::read(store.blob_path(b"key")).unwrap(),
+        b"external writer bypassed the store"
+    );
+    store.close().await.unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_mapping_and_image_handle_behavior_is_characterized() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READONLY, SEC_IMAGE};
+
+    fn mapping(file: &std::fs::File, protection: u32) -> io::Result<OwnedHandle> {
+        // SAFETY: the source handle remains live for the call and the unnamed mapping has no
+        // security-attribute or name pointers to retain.
+        let handle = unsafe {
+            CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                protection,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: the mapping handle is uniquely owned and CloseHandle-compatible.
+            Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+        }
+    }
+
+    let root = test_directory();
+    if !qualify_contract_test(root.path(), "mapped-handle-characterization").unwrap() {
+        return;
+    }
+    let store = BlockingAtomicBlobStore::open(root.path(), "mapped", options()).unwrap();
+    store.save(b"key", b"old".to_vec()).unwrap();
+    let canonical = store.blob_path(b"key");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&canonical)
+        .unwrap();
+    let _mapping = mapping(&file, PAGE_READONLY).unwrap();
+    let data_result = store.save(b"key", b"new".to_vec());
+    if let Err(error) = &data_result {
+        assert!(matches!(
+            windows_commit_raw_error(error),
+            Some(code) if code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_ACCESS_DENIED as i32
+        ));
+    }
+    drop(file);
+    store.close().unwrap();
+
+    let image_store =
+        BlockingAtomicBlobStore::open(root.path(), "mapped-image", options()).unwrap();
+    let image_path = image_store.blob_path(b"key");
+    std::fs::copy(std::env::current_exe().unwrap(), &image_path).unwrap();
+    let image_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&image_path)
+        .unwrap();
+    let image_result = mapping(&image_file, PAGE_READONLY | SEC_IMAGE);
+    let image_commit_result = image_result
+        .is_ok()
+        .then(|| image_store.save(b"key", b"replacement".to_vec()));
+    if let Some(artifact_root) = std::env::var_os("ATOMIC_BLOB_TEST_ARTIFACT_DIR") {
+        let directory = PathBuf::from(artifact_root).join("handle-characterization");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("mapping.txt"),
+            format!(
+                "data_mapping_commit_result={data_result:?}\nimage_mapping_result={image_result:?}\nimage_mapping_commit_result={image_commit_result:?}\n"
+            ),
+        )
+        .unwrap();
+    }
+    if let Ok(image_mapping) = image_result {
+        if let Err(error) = image_commit_result.expect("a successful mapping attempted a commit") {
+            assert!(matches!(
+                windows_commit_raw_error(&error),
+                Some(code) if code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_ACCESS_DENIED as i32
+            ));
+        }
+        drop(image_mapping);
+    }
+    drop(image_file);
+    image_store.close().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_directory_flush_is_characterized_on_the_actual_test_volume() {
+    let root = test_directory();
+    let config = initialize_platform(
+        root.path().to_path_buf(),
+        PathBuf::from("directory-sync"),
+        format(),
+        TEST_MAXIMUM,
+        1,
+    )
+    .unwrap();
+    let environment = match WindowsTestEnvironment::inspect(&config.namespace) {
+        Ok(environment) => environment,
+        Err(error) if std::env::var_os("ATOMIC_BLOB_REQUIRE_LOCAL_NTFS").is_none() => {
+            eprintln!("directory-flush characterization unavailable: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to characterize required Windows test root: {error}"),
+    };
+    let result = sync_windows_directory(&config);
+    if let Some(artifact_root) = std::env::var_os("ATOMIC_BLOB_TEST_ARTIFACT_DIR") {
+        let directory = PathBuf::from(artifact_root).join("directory-sync");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("characterization.txt"),
+            format!("{}directory_flush={result:?}\n", environment.report()),
+        )
+        .unwrap();
+    }
+    if environment.is_local_ntfs() {
+        result.unwrap();
+    }
+}
+
+#[cfg(windows)]
 #[tokio::test]
 #[allow(clippy::permissions_set_readonly_false)]
 async fn windows_cleanup_classifies_owned_names_ages_and_mixed_failures() {
@@ -1846,6 +2318,11 @@ fn windows_child_process_interruptions_leave_only_permitted_states() {
 
     fn run(stage: &str) {
         let root = test_directory();
+        if !qualify_contract_test(root.path(), &format!("deterministic-interruption-{stage}"))
+            .unwrap()
+        {
+            return;
+        }
         let store = BlockingAtomicBlobStore::open(root.path(), "interrupt", options()).unwrap();
         store.save(b"key", b"old".to_vec()).unwrap();
         store.close().unwrap();
@@ -1924,6 +2401,423 @@ fn windows_child_process_interruptions_leave_only_permitted_states() {
     ] {
         run(stage);
     }
+}
+
+#[cfg(windows)]
+fn windows_stress_payload(seed: u64, iteration: u64, size: usize) -> Vec<u8> {
+    let mut payload = vec![0_u8; size];
+    if size == 0 {
+        return payload;
+    }
+    let identity = seed
+        .to_le_bytes()
+        .into_iter()
+        .chain(iteration.to_le_bytes())
+        .collect::<Vec<_>>();
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte = identity[index % identity.len()]
+            ^ u8::try_from(index % 251).expect("the modulus fits in u8");
+    }
+    payload
+}
+
+#[cfg(windows)]
+fn windows_stress_observation_is_valid(
+    campaign: &str,
+    killed: bool,
+    loaded: &Result<Option<Vec<u8>>, AtomicBlobStoreError>,
+    previous: Option<&[u8]>,
+    valid_candidates: &[Vec<u8>],
+    committed: &[u64],
+) -> bool {
+    killed
+        && match loaded {
+            Ok(None) => campaign == "create" && committed.is_empty(),
+            Ok(Some(payload)) => {
+                previous == Some(payload.as_slice())
+                    || valid_candidates
+                        .iter()
+                        .any(|candidate| candidate == payload)
+            }
+            Err(_) => false,
+        }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_stress_observation_rejects_absence_after_reported_create_commit() {
+    let absent: Result<Option<Vec<u8>>, AtomicBlobStoreError> = Ok(None);
+    assert!(windows_stress_observation_is_valid(
+        "create",
+        true,
+        &absent,
+        None,
+        &[],
+        &[],
+    ));
+    assert!(!windows_stress_observation_is_valid(
+        "create",
+        true,
+        &absent,
+        None,
+        &[],
+        &[7],
+    ));
+    assert!(!windows_stress_observation_is_valid(
+        "replace",
+        true,
+        &absent,
+        None,
+        &[],
+        &[],
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_replacement_stress_child() {
+    use std::io::Write;
+
+    let Some(root) = std::env::var_os("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let seed = std::env::var("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_SEED")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let mut iteration = std::env::var("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_ITERATION")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let size = std::env::var("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_SIZE")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let streaming = std::env::var("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_API").unwrap() == "streaming";
+    let tokio_facade = std::env::var("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_FACADE").unwrap() == "tokio";
+    let stress_options = AtomicBlobStoreOptions::new(format()).with_max_blob_size(8 * 1024 * 1024);
+
+    if tokio_facade {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = AtomicBlobStore::open(&root, "stress", stress_options)
+                .await
+                .unwrap();
+            println!("READY");
+            std::io::stdout().flush().unwrap();
+            loop {
+                let payload = windows_stress_payload(seed, iteration, size);
+                println!("BEGIN {iteration}");
+                std::io::stdout().flush().unwrap();
+                if streaming {
+                    store
+                        .save_from(
+                            b"key",
+                            &mut Cursor::new(&payload),
+                            u64::try_from(payload.len()).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    store.save(b"key", payload).await.unwrap();
+                }
+                println!("COMMITTED {iteration}");
+                std::io::stdout().flush().unwrap();
+                iteration = iteration.wrapping_add(1);
+            }
+        });
+    } else {
+        let store = BlockingAtomicBlobStore::open(&root, "stress", stress_options).unwrap();
+        println!("READY");
+        std::io::stdout().flush().unwrap();
+        loop {
+            let payload = windows_stress_payload(seed, iteration, size);
+            println!("BEGIN {iteration}");
+            std::io::stdout().flush().unwrap();
+            if streaming {
+                store
+                    .save_from(
+                        b"key",
+                        &mut Cursor::new(&payload),
+                        u64::try_from(payload.len()).unwrap(),
+                    )
+                    .unwrap();
+            } else {
+                store.save(b"key", payload).unwrap();
+            }
+            println!("COMMITTED {iteration}");
+            std::io::stdout().flush().unwrap();
+            iteration = iteration.wrapping_add(1);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "native local-NTFS evidence campaign; enabled explicitly by Windows CI"]
+fn windows_randomized_replacement_stress_exposes_only_complete_candidates() {
+    use std::fmt::Write as _;
+    use std::io::{BufRead, Read};
+    use std::process::{Command, Stdio};
+
+    const SIZES: [usize; 5] = [
+        0,
+        1,
+        STREAM_CHUNK_SIZE,
+        3 * STREAM_CHUNK_SIZE + 17,
+        4 * 1024 * 1024,
+    ];
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn iterations_from_output(output: &str, prefix: &str) -> Vec<u64> {
+        output
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .filter_map(|value| value.parse().ok())
+            .collect()
+    }
+
+    fn copy_failure_evidence(
+        artifact_root: &Path,
+        campaign: &str,
+        attempt: usize,
+        root: &Path,
+        manifest: &str,
+        stdout: &str,
+        stderr: &str,
+    ) {
+        let destination = artifact_root
+            .join("stress-failures")
+            .join(format!("{campaign}-{attempt:05}"));
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("reproduction.txt"), manifest).unwrap();
+        std::fs::write(destination.join("child.stdout.log"), stdout).unwrap();
+        std::fs::write(destination.join("child.stderr.log"), stderr).unwrap();
+        let namespace = root.join("stress");
+        if namespace.is_dir() {
+            for entry in std::fs::read_dir(namespace).unwrap().filter_map(Result::ok) {
+                if entry.path().is_file() {
+                    std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+                }
+            }
+        }
+    }
+
+    let attempts = std::env::var("ATOMIC_BLOB_WINDOWS_STRESS_ATTEMPTS")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(2_000);
+    assert!(attempts >= 2);
+    let create_attempts = attempts / 5;
+    let replace_attempts = attempts - create_attempts;
+    let seed = std::env::var("ATOMIC_BLOB_WINDOWS_STRESS_SEED")
+        .ok()
+        .map(|value| value.parse::<u64>().unwrap())
+        .unwrap_or(0x5eed_cafe_d15c_a11e);
+    let artifact_root = std::env::var_os("ATOMIC_BLOB_TEST_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("atomic-blob-store-stress-{}", std::process::id()))
+        });
+    std::fs::create_dir_all(&artifact_root).unwrap();
+    let mut random = seed;
+    let mut total_committed = 0_usize;
+    let mut replacement_committed = 0_usize;
+    let mut total_owned_staging = 0_usize;
+    let mut summary = format!(
+        "seed={seed}\nattempts={attempts}\ncreate_attempts={create_attempts}\nreplace_attempts={replace_attempts}\n"
+    );
+
+    for (campaign, campaign_attempts) in
+        [("create", create_attempts), ("replace", replace_attempts)]
+    {
+        let root = test_directory();
+        std::fs::create_dir(root.path().join("stress")).unwrap();
+        assert!(qualify_contract_test(root.path(), &format!("stress-{campaign}")).unwrap());
+        let stress_options =
+            AtomicBlobStoreOptions::new(format()).with_max_blob_size(8 * 1024 * 1024);
+        let canonical = {
+            let store =
+                BlockingAtomicBlobStore::open(root.path(), "stress", stress_options.clone())
+                    .unwrap();
+            let path = store.blob_path(b"key");
+            store.close().unwrap();
+            path
+        };
+        let mut previous = if campaign == "replace" {
+            let initial = windows_stress_payload(seed, u64::MAX, 1);
+            let store =
+                BlockingAtomicBlobStore::open(root.path(), "stress", stress_options.clone())
+                    .unwrap();
+            store.save(b"key", initial.clone()).unwrap();
+            store.close().unwrap();
+            Some(initial)
+        } else {
+            None
+        };
+
+        for attempt in 0..campaign_attempts {
+            if campaign == "create" {
+                match std::fs::remove_file(&canonical) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("failed to reset create campaign: {error}"),
+                }
+                previous = None;
+            }
+            let global_attempt = if campaign == "create" {
+                attempt
+            } else {
+                create_attempts + attempt
+            };
+            let size = SIZES[global_attempt % SIZES.len()];
+            let api = if global_attempt % 3 == 0 {
+                "streaming"
+            } else {
+                "complete"
+            };
+            let facade = if global_attempt % 4 == 0 {
+                "tokio"
+            } else {
+                "blocking"
+            };
+            let first_iteration = u64::try_from(global_attempt).unwrap() << 32;
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::windows_replacement_stress_child",
+                    "--nocapture",
+                ])
+                .env("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_ROOT", root.path())
+                .env("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_SEED", seed.to_string())
+                .env(
+                    "ATOMIC_BLOB_WINDOWS_STRESS_CHILD_ITERATION",
+                    first_iteration.to_string(),
+                )
+                .env("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_SIZE", size.to_string())
+                .env("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_API", api)
+                .env("ATOMIC_BLOB_WINDOWS_STRESS_CHILD_FACADE", facade)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut stdout = String::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    output.read_line(&mut line).unwrap(),
+                    0,
+                    "child exited before READY"
+                );
+                stdout.push_str(&line);
+                if line.trim() == "READY" {
+                    break;
+                }
+            }
+            let delay_us = 50 + next_random(&mut random) % 20_000;
+            std::thread::sleep(Duration::from_micros(delay_us));
+            let killed = child.kill().is_ok();
+            let status = child.wait().unwrap();
+            output.read_to_string(&mut stdout).unwrap();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            let begun = iterations_from_output(&stdout, "BEGIN ");
+            let committed = iterations_from_output(&stdout, "COMMITTED ");
+            total_committed += committed.len();
+            if campaign == "replace" {
+                replacement_committed += committed.len();
+            }
+            let staging = windows_save_staging_files(&root.path().join("stress"));
+            total_owned_staging += staging.len();
+
+            let store =
+                BlockingAtomicBlobStore::open(root.path(), "stress", stress_options.clone())
+                    .unwrap();
+            let loaded = store.load(b"key");
+            store.close().unwrap();
+            let valid_candidates = begun
+                .iter()
+                .map(|iteration| windows_stress_payload(seed, *iteration, size))
+                .collect::<Vec<_>>();
+            let valid = windows_stress_observation_is_valid(
+                campaign,
+                killed,
+                &loaded,
+                previous.as_deref(),
+                &valid_candidates,
+                &committed,
+            );
+            let environment_report = artifact_root
+                .join("environments")
+                .join(format!("stress-{campaign}.txt"));
+            let mut manifest = String::new();
+            writeln!(manifest, "seed={seed}").unwrap();
+            writeln!(manifest, "campaign={campaign}").unwrap();
+            writeln!(manifest, "attempt={attempt}").unwrap();
+            writeln!(manifest, "global_attempt={global_attempt}").unwrap();
+            writeln!(manifest, "delay_us={delay_us}").unwrap();
+            writeln!(manifest, "size={size}").unwrap();
+            writeln!(manifest, "api={api}").unwrap();
+            writeln!(manifest, "facade={facade}").unwrap();
+            writeln!(manifest, "first_iteration={first_iteration}").unwrap();
+            writeln!(manifest, "child_status={status}").unwrap();
+            writeln!(manifest, "begun={begun:?}").unwrap();
+            writeln!(manifest, "committed={committed:?}").unwrap();
+            writeln!(manifest, "canonical={canonical:?}").unwrap();
+            writeln!(manifest, "owned_staging={staging:?}").unwrap();
+            writeln!(manifest, "environment_report={environment_report:?}").unwrap();
+            writeln!(
+                manifest,
+                "reproduce=ATOMIC_BLOB_WINDOWS_STRESS_ATTEMPTS={attempts} \
+                 ATOMIC_BLOB_WINDOWS_STRESS_SEED={seed} cargo test --locked --all-features \
+                 tests::windows_randomized_replacement_stress_exposes_only_complete_candidates \
+                 -- --ignored --exact --nocapture"
+            )
+            .unwrap();
+            if !valid {
+                copy_failure_evidence(
+                    &artifact_root,
+                    campaign,
+                    attempt,
+                    root.path(),
+                    &manifest,
+                    &stdout,
+                    &stderr,
+                );
+                panic!("invalid canonical state after stress kill; {manifest}; load={loaded:?}");
+            }
+            if let Ok(Some(payload)) = loaded {
+                previous = Some(payload);
+            }
+            for path in staging {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        summary.push_str(&format!("{campaign}_completed=true\n"));
+    }
+    summary.push_str(&format!(
+        "observed_completed_operations={total_committed}\nobserved_completed_replacements={replacement_committed}\nobserved_owned_staging_files={total_owned_staging}\n"
+    ));
+    std::fs::write(artifact_root.join("stress-summary.txt"), &summary).unwrap();
+    assert!(
+        replacement_committed > 0,
+        "campaign never demonstrably completed a replacement\n{summary}"
+    );
 }
 
 #[cfg(any(unix, windows))]

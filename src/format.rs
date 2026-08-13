@@ -66,6 +66,12 @@ pub fn write_stream_envelope(
     chunks: &mut Receiver<SaveStreamMessage>,
 ) -> Result<(), AtomicBlobStoreError> {
     let header = envelope_header(&config.format, declared_len, config.maximum)?;
+    #[cfg(all(test, windows))]
+    hit_test_stage(
+        config,
+        TestStage::BeforeHeaderWrite,
+        StoreOperation::WriteEnvelope,
+    )?;
     writer
         .write_all(&header)
         .map_err(|source| AtomicBlobStoreError::Io {
@@ -96,6 +102,12 @@ pub fn write_stream_envelope(
                         declared: declared_len,
                     });
                 }
+                #[cfg(all(test, windows))]
+                hit_test_stage(
+                    config,
+                    TestStage::BeforePayloadWrite,
+                    StoreOperation::WriteEnvelope,
+                )?;
                 writer
                     .write_all(&chunk)
                     .map_err(|source| AtomicBlobStoreError::Io {
@@ -124,6 +136,12 @@ pub fn write_stream_envelope(
                         actual: written,
                     });
                 }
+                #[cfg(all(test, windows))]
+                hit_test_stage(
+                    config,
+                    TestStage::BeforeChecksumWrite,
+                    StoreOperation::WriteEnvelope,
+                )?;
                 writer
                     .write_all(&checksum.to_be_bytes())
                     .map_err(|source| AtomicBlobStoreError::Io {

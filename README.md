@@ -79,10 +79,14 @@ points, another writer, network filesystems, or storage hardware that violates
 filesystem synchronization semantics.
 
 The crate runs on Unix and Windows, but successful operation is not a
-certification of every filesystem accepted by those operating systems. The
-Windows contract is tested on local NTFS. ReFS, FAT/exFAT, SMB shares,
-cloud-backed directories, container or virtual volumes, and other filesystems
-are best-effort and have no claimed interruption or durability guarantee.
+certification of every filesystem accepted by those operating systems.
+
+| Windows test root | Support status | Evidence meaning |
+| --- | --- | --- |
+| Local fixed NTFS volume | Tested contract target | Eligible for process-interruption visibility evidence |
+| ReFS or FAT/exFAT | Best-effort compatibility | Passing tests do not substantiate atomic visibility or durability |
+| SMB, redirected, or cloud-backed path | Best-effort compatibility | No interruption, coordination, or durability guarantee |
+| Container, virtual, or otherwise uncharacterized storage | Configuration-specific | Evidence applies only when the actual test volume is identified and qualified |
 
 CRC32C detects accidental corruption only. There is no authentication,
 encryption, tamper resistance, compare-and-swap, transaction support, locking,
@@ -94,11 +98,14 @@ filesystems whose rename behavior matches the tested environments, this is
 intended to provide a complete old-or-new canonical file under process
 interruption; clear is correspondingly intended to provide old-or-absent.
 
-On Windows, native tests currently terminate processes immediately before and
-after `MoveFileExW`. They substantiate the surrounding state transitions but
-do not prove behavior when termination overlaps the syscall itself. Old-or-new
-visibility during that narrow window is an engineering expectation based on
-local NTFS rename behavior, not an explicit universal Win32 guarantee.
+On Windows, the native evidence workflow identifies the volume containing each
+actual contract-test root, rejects non-local or non-NTFS roots as release
+evidence, exercises deterministic failure phases, and abruptly terminates
+uncooperative save loops at randomized times around repeated `MoveFileExW`
+calls. The bounded profile performs 2,000 terminations and the manually
+dispatched release soak performs 10,000. This is empirical, reproducible local
+NTFS evidence—not proof of a universal Win32 guarantee or proof that any
+particular termination overlapped the syscall.
 
 Flush and write-through calls request persistence but cannot guarantee survival
 under arbitrary power loss or storage that ignores those requests. The Windows
@@ -127,10 +134,11 @@ names are never parsed or cleaned by this crate. Windows uses exclusive
 same-directory staging files, `FlushFileBuffers`, and native write-through
 moves; its explicit cleanup recognizes only names owned by the configured
 suffix and store format. Native Windows CI exercises failure boundaries,
-process termination immediately around namespace operations, extended and
-non-Unicode paths where the hosted filesystem permits them, both facades, and
-independently extracted package consumers. See [TODO.md](TODO.md) for the
-additional evidence required to exercise interruption overlapping replacement.
+randomized process termination during repeated replacement, open-handle
+behavior, extended and non-Unicode paths where the hosted filesystem permits
+them, both facades, and independently extracted package consumers. See
+[TODO.md](TODO.md) for the evidence runbook and per-release qualification
+record.
 
 See [FORMAT.md](FORMAT.md) for the byte-level stable format and compatibility
 policy and [RELEASE.md](RELEASE.md) for the independent release-readiness

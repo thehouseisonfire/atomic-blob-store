@@ -23,12 +23,13 @@
 //!
 //! On native local filesystems with rename semantics matching the tested
 //! environments, this design is intended to provide complete old-or-new
-//! canonical-path visibility under process interruption. Windows interruption
-//! evidence currently covers local NTFS and termination immediately before and
-//! after the replacement call; atomicity while interruption overlaps the Win32
-//! call is an engineering expectation, not an explicit universal Win32 or
-//! cross-filesystem guarantee. ReFS, FAT/exFAT, SMB, cloud-backed directories,
-//! container or virtual volumes, and other filesystems are not certified.
+//! canonical-path visibility under process interruption. The Windows evidence
+//! suite qualifies the actual test root as local NTFS, injects deterministic
+//! failures at each native phase, and kills uncooperative child processes at
+//! randomized times during repeated replacements. That evidence is empirical;
+//! it is not an explicit universal Win32 or cross-filesystem guarantee. ReFS,
+//! FAT/exFAT, SMB, cloud-backed directories, container or virtual volumes, and
+//! other filesystems are not certified.
 //!
 //! Flush and write-through calls request persistence from the operating system
 //! and storage stack. They cannot guarantee survival under arbitrary power
@@ -138,13 +139,18 @@ use filesystem::{
     quarantine_blob, save_blob, save_blob_from_receiver,
 };
 #[cfg(all(test, feature = "tokio", windows))]
-use filesystem::{is_owned_temporary_filename, move_file, refresh_windows_clear_age, wide_path};
+use filesystem::{
+    is_owned_temporary_filename, move_file, refresh_windows_clear_age, sync_windows_directory,
+    wide_path,
+};
 #[cfg(any(unix, windows))]
 #[allow(unused_imports)]
 use format::{
     envelope_header, envelope_parts, load_blob, load_blob_into_sender, write_stream_envelope,
 };
 mod path;
+#[cfg(all(test, feature = "tokio", windows))]
+mod windows_test;
 pub use path::blob_filename;
 #[cfg(any(unix, windows))]
 use path::key_hash;

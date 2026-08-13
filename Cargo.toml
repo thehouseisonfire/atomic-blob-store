@@ -70,6 +70,12 @@ tempfile = "3"
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+] }
+
 [[example]]
 name = "config_snapshot"
 required-features = ["tokio"]

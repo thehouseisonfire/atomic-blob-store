@@ -135,6 +135,8 @@ pub enum AtomicBlobStoreError {
         #[source]
         source: io::Error,
     },
+    /// Replacement failed after complete staging. The canonical state may be
+    /// old or new; callers that need the resulting state must reload it.
     #[error("atomic blob commit failed: {source}")]
     AtomicCommit {
         #[source]
