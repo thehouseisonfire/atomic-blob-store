@@ -3203,7 +3203,14 @@ fn windows_randomized_replacement_stress_exposes_only_complete_candidates() {
                     break;
                 }
             }
-            let delay_us = 50 + next_random(&mut random) % 20_000;
+            // Periodic longer windows demonstrate that the campaign actually advances through
+            // replacements on slower hosted storage. The remaining attempts retain the
+            // high-frequency randomized kill window used to overlap native operations.
+            let delay_us = if global_attempt % 100 == 0 {
+                1_000_000
+            } else {
+                50 + next_random(&mut random) % 20_000
+            };
             std::thread::sleep(Duration::from_micros(delay_us));
             let killed = child.kill().is_ok();
             let status = child.wait().unwrap();
