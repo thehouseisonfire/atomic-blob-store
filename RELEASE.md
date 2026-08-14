@@ -34,6 +34,27 @@ every kill overlapped `MoveFileExW`, and a successful Windows
 namespace-directory flush is an additional checked request, not a documented
 equivalent of Unix directory `fsync`.
 
+## 2026-08-13 Windows qualification evidence
+
+Workflow [31758613077](https://github.com/thehouseisonfire/atomic-blob-store/actions/runs/31758613077)
+passed at commit `0e0878e55988223e8972bf342b3115322a97dbf4` on both runners.
+The retained artifacts are
+[windows-2022](https://github.com/thehouseisonfire/atomic-blob-store/actions/runs/31758613077/artifacts/9203950620)
+and
+[windows-latest](https://github.com/thehouseisonfire/atomic-blob-store/actions/runs/31758613077/artifacts/9203846474).
+
+- All 80 contract-test environment reports identified a local fixed NTFS root.
+- `windows-2022` completed 10,000 termination attempts (2,000 create and 8,000
+  replace), observing 2,271 completed replacements.
+- `windows-latest` completed 2,000 attempts (400 create and 1,600 replace),
+  observing 647 completed replacements.
+- Both used seed `6840335469060923678`, Rust 1.85.0
+  (`4d91de4e48198da2e33413efdcd9cd2cc0c46688`), and Cargo 1.85.0
+  (`d73d2caf9 2024-12-31`).
+- The deterministic native suite, streaming state matrix, mapping and external
+  writer characterization, debug/release and feature suites, Clippy, docs, and
+  extracted blocking/Tokio consumers passed on both runners.
+
 Before publication, maintainers must still explicitly accept compatibility,
 security-response, documentation, CI, and release-cadence ownership. The
 public API and V1 format must also receive feedback from an external,

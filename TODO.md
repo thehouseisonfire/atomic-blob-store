@@ -2,14 +2,14 @@
 
 ## Native replacement failure injection
 
-- [ ] Replace the pre-call move hooks with a test-only Windows operations seam
+- [x] Replace the pre-call move hooks with a test-only Windows operations seam
   that can return chosen errors from the initial non-replacing and replacing
   `MoveFileExW` calls themselves.
-- [ ] Exercise documented definitely-not-committed replacement errors and
+- [x] Exercise documented definitely-not-committed replacement errors and
   conservatively ambiguous errors. For each result, reload through a fresh
   store and assert only the canonical and staging states justified by that
   classification.
-- [ ] Keep production dispatch static and preserve the public API, V1 envelope,
+- [x] Keep production dispatch static and preserve the public API, V1 envelope,
   staging-name format, and existing error variants.
 
 Acceptance: replacement-error tests model the native call's result rather than
@@ -18,13 +18,13 @@ the destination remained unchanged.
 
 ## Windows streaming failure-state matrix
 
-- [ ] Add local-NTFS-qualified Windows cases for early EOF, trailing input,
+- [x] Add local-NTFS-qualified Windows cases for early EOF, trailing input,
   source I/O failure, cancellation during staging writes, cancellation after
   input completion, and failure immediately before commit.
-- [ ] For each case, assert the returned error category, freshly loaded
+- [x] For each case, assert the returned error category, freshly loaded
   canonical value, and owned staging-file state, including whether age-gated
   cleanup is permitted.
-- [ ] Cover both blocking and Tokio cancellation semantics where they differ,
+- [x] Cover both blocking and Tokio cancellation semantics where they differ,
   while sharing common state assertions to avoid duplicating equivalent cases.
 
 Acceptance: every streaming error and cancellation boundary has an explicit
@@ -33,17 +33,17 @@ coverage.
 
 ## Open-handle and unsupported-writer characterization
 
-- [ ] Hold an active data-file mapping created with `MapViewOfFile` while
+- [x] Hold an active data-file mapping created with `MapViewOfFile` while
   replacement is attempted, recording and asserting the supported outcome on
   the qualified runner.
-- [ ] Hold an active executable-image mapping of a valid image while its
+- [x] Hold an active executable-image mapping of a valid image while its
   canonical path is replaced. Record environmental limitations and accept only
   documented sharing/access errors when replacement is rejected.
-- [ ] Run bounded concurrent negative-contract campaigns with independent store
+- [x] Run bounded concurrent negative-contract campaigns with independent store
   instances and a direct external writer targeting the same key. Assert only
   that observed store-produced envelopes are complete and valid; do not assert
   ordering or last-writer behavior.
-- [ ] Preserve same-store, same-key FIFO coverage as the supported concurrency
+- [x] Preserve same-store, same-key FIFO coverage as the supported concurrency
   baseline.
 
 Acceptance: evidence distinguishes canonical-name replacement from data held by
@@ -51,20 +51,20 @@ existing mappings and from deliberately unsupported writers.
 
 ## Native evidence and release qualification
 
-- [ ] Run the manually dispatched `windows-2022` 10,000-termination soak and
+- [x] Run the manually dispatched `windows-2022` 10,000-termination soak and
   retain its artifact URL. Confirm every contract-test environment report
   identifies the actual root as local fixed NTFS and the replacement campaign
   reports completed replacements.
-- [ ] Run the `windows-latest` 2,000-termination compatibility campaign and
+- [x] Run the `windows-latest` 2,000-termination compatibility campaign and
   retain its artifact, exact Rust/Cargo versions, seed, attempt counts, and
   completed-replacement count.
-- [ ] Confirm the native replacement-error tests, Windows streaming matrix,
+- [x] Confirm the native replacement-error tests, Windows streaming matrix,
   mapping/image tests, standard Windows suite, and extracted-package consumers
   pass in the qualifying workflow.
-- [ ] Review the resulting artifacts for reproducibility: every failure must
+- [x] Review the resulting artifacts for reproducibility: every failure must
   contain its seed, kill delay, child iteration data, canonical file, owned
   staging files, stdout, stderr, environment report, and reproduction command.
-- [ ] Record the qualifying artifact links in the release evidence summary and
+- [x] Record the qualifying artifact links in the release evidence summary and
   align crate docs, README, error documentation, changelog, and release notes
   with the demonstrated boundary.
 
