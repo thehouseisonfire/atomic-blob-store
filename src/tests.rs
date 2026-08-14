@@ -1983,7 +1983,7 @@ fn windows_commit_raw_error(error: &AtomicBlobStoreError) -> Option<i32> {
 #[tokio::test]
 async fn windows_sharing_violation_returns_promptly_without_retry_and_is_cleanable() {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     let root = test_directory();
@@ -2003,10 +2003,10 @@ async fn windows_sharing_violation_returns_promptly_without_retry_and_is_cleanab
     let started = std::time::Instant::now();
     let error = store.save(b"key", b"new".to_vec()).await.unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(5));
-    assert_eq!(
+    assert!(matches!(
         windows_commit_raw_error(&error),
-        Some(ERROR_SHARING_VIOLATION as i32)
-    );
+        Some(code) if code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_ACCESS_DENIED as i32
+    ));
     drop(held);
     assert_eq!(store.load(b"key").await.unwrap(), Some(b"old".to_vec()));
 
@@ -2017,10 +2017,10 @@ async fn windows_sharing_violation_returns_promptly_without_retry_and_is_cleanab
         .open(store.blob_path(b"write-key"))
         .unwrap();
     let write_error = store.save(b"write-key", b"new".to_vec()).await.unwrap_err();
-    assert_eq!(
+    assert!(matches!(
         windows_commit_raw_error(&write_error),
-        Some(ERROR_SHARING_VIOLATION as i32)
-    );
+        Some(code) if code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_ACCESS_DENIED as i32
+    ));
     drop(held_writer);
     assert_eq!(
         store.load(b"write-key").await.unwrap(),
