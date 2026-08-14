@@ -340,6 +340,7 @@ impl EngineHandle {
     }
 
     #[cfg(all(test, windows))]
+    #[allow(dead_code)]
     pub(crate) fn open_with_test_windows_move(
         root: impl Into<PathBuf>,
         namespace: impl AsRef<OsStr>,
