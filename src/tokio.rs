@@ -140,6 +140,38 @@ impl AtomicBlobStore {
             .map(|core| Self { core })
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) async fn open_with_test_windows_move(
+        root: impl Into<PathBuf>,
+        namespace: impl AsRef<OsStr>,
+        options: AtomicBlobStoreOptions,
+        windows_move: crate::engine::WindowsMoveOperation,
+    ) -> Result<Self, AtomicBlobStoreError> {
+        let root = root.into();
+        let namespace = namespace.as_ref().to_owned();
+        let (sender, receiver) = flume::bounded(1);
+        std::thread::Builder::new()
+            .name("atomic-blob-store-initialize".into())
+            .spawn(move || {
+                let result = EngineHandle::open_with_test_windows_move(
+                    root,
+                    namespace,
+                    options,
+                    windows_move,
+                );
+                let _ = sender.send(result);
+            })
+            .map_err(|source| AtomicBlobStoreError::Io {
+                operation: crate::StoreOperation::StartInitialization,
+                source,
+            })?;
+        receiver
+            .recv_async()
+            .await
+            .unwrap_or(Err(AtomicBlobStoreError::EngineFailed))
+            .map(|core| Self { core })
+    }
+
     #[cfg(all(test, any(unix, windows)))]
     pub(crate) fn registry_entries(&self) -> usize {
         self.core

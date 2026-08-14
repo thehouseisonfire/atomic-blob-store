@@ -90,6 +90,8 @@ pub fn initialize_platform(
         max_concurrent_operations,
         #[cfg(all(test, any(unix, windows)))]
         hook: None,
+        #[cfg(all(test, windows))]
+        windows_move: None,
         #[cfg(feature = "bench-instrumentation")]
         benchmark_events: None,
     })
@@ -514,6 +516,46 @@ pub(crate) fn move_file(source: &Path, destination: &Path, flags: u32) -> Result
 }
 
 #[cfg(windows)]
+fn move_windows_save_file(
+    _config: &StoreConfig,
+    source: &Path,
+    destination: &Path,
+    flags: u32,
+) -> Result<(), io::Error> {
+    #[cfg(test)]
+    if let Some(operation) = &_config.windows_move {
+        return operation(source, destination, flags);
+    }
+    move_file(source, destination, flags)
+}
+
+#[cfg(windows)]
+fn commit_windows_staging(
+    config: &StoreConfig,
+    staging: &Path,
+    destination: &Path,
+) -> Result<(), AtomicBlobStoreError> {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    match move_windows_save_file(config, staging, destination, MOVEFILE_WRITE_THROUGH) {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(error.raw_os_error(), Some(code) if (code as u32) == ERROR_FILE_EXISTS || (code as u32) == ERROR_ALREADY_EXISTS) => {
+            move_windows_save_file(
+                config,
+                staging,
+                destination,
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+            .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })
+        }
+        Err(source) => Err(AtomicBlobStoreError::AtomicCommit { source }),
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn delete_file(path: &Path) -> Result<(), io::Error> {
     let path = wide_path(path);
     // SAFETY: the pointer references a NUL-terminated wide string for the call.
@@ -798,11 +840,6 @@ pub(crate) fn save_blob(
     path: &Path,
     payload: &[u8],
 ) -> Result<(), AtomicBlobStoreError> {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
     #[cfg(test)]
     hit_test_stage(
         config,
@@ -849,30 +886,7 @@ pub(crate) fn save_blob(
         {
             return Err(AtomicBlobStoreError::AtomicCommit { source });
         }
-        #[cfg(test)]
-        if let Some(hook) = &config.hook {
-            hook(TestStage::BeforeInitialMove)
-                .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
-        }
-        let initial = move_file(&staging, path, MOVEFILE_WRITE_THROUGH);
-        match initial {
-            Ok(()) => {}
-            Err(error) if matches!(error.raw_os_error(), Some(code) if (code as u32) == ERROR_FILE_EXISTS || (code as u32) == ERROR_ALREADY_EXISTS) =>
-            {
-                #[cfg(test)]
-                if let Some(hook) = &config.hook {
-                    hook(TestStage::BeforeReplacingMove)
-                        .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
-                }
-                move_file(
-                    &staging,
-                    path,
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-                .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
-            }
-            Err(source) => return Err(AtomicBlobStoreError::AtomicCommit { source }),
-        }
+        commit_windows_staging(config, &staging, path)?;
         #[cfg(test)]
         hit_test_stage(
             config,
@@ -894,11 +908,6 @@ pub(crate) fn save_blob_from_receiver(
     declared_len: u64,
     chunks: &mut Receiver<SaveStreamMessage>,
 ) -> Result<(), AtomicBlobStoreError> {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
     #[cfg(test)]
     hit_test_stage(
         config,
@@ -948,30 +957,7 @@ pub(crate) fn save_blob_from_receiver(
         {
             return Err(AtomicBlobStoreError::AtomicCommit { source });
         }
-        #[cfg(test)]
-        if let Some(hook) = &config.hook {
-            hook(TestStage::BeforeInitialMove)
-                .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
-        }
-        let initial = move_file(&staging, path, MOVEFILE_WRITE_THROUGH);
-        match initial {
-            Ok(()) => {}
-            Err(error) if matches!(error.raw_os_error(), Some(code) if (code as u32) == ERROR_FILE_EXISTS || (code as u32) == ERROR_ALREADY_EXISTS) =>
-            {
-                #[cfg(test)]
-                if let Some(hook) = &config.hook {
-                    hook(TestStage::BeforeReplacingMove)
-                        .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
-                }
-                move_file(
-                    &staging,
-                    path,
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-                .map_err(|source| AtomicBlobStoreError::AtomicCommit { source })?;
-            }
-            Err(source) => return Err(AtomicBlobStoreError::AtomicCommit { source }),
-        }
+        commit_windows_staging(config, &staging, path)?;
         #[cfg(test)]
         hit_test_stage(
             config,

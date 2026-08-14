@@ -6,6 +6,10 @@
   deterministic save-phase failures, sharing and already-open-handle coverage,
   and reproducible 2,000-attempt CI/10,000-attempt release interruption
   campaigns. Pin the release-evidence toolchain to Rust 1.85.0.
+- Inject Windows save failures at the native move-call boundary, add an explicit
+  streaming failure/cancellation state matrix, retain active data and image
+  mapping views during replacement, and bound unsupported concurrent-writer
+  characterization.
 - Clarify that Windows old-or-new replacement behavior is a local-NTFS,
   test-backed engineering expectation rather than a universal Win32 or
   cross-filesystem guarantee, and distinguish namespace flush requests from

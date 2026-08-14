@@ -1416,6 +1416,46 @@ fn windows_save_staging_files(namespace: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(windows)]
+fn assert_windows_stream_failure_state(
+    root: &Path,
+    namespace_name: &str,
+    expected_payload: &[u8],
+    expected_staging: usize,
+) {
+    let store = BlockingAtomicBlobStore::open(root, namespace_name, options()).unwrap();
+    assert_eq!(
+        store.load(b"key").unwrap().as_deref(),
+        Some(expected_payload)
+    );
+    let namespace = root.join(namespace_name);
+    let staging = windows_save_staging_files(&namespace);
+    assert_eq!(staging.len(), expected_staging);
+    for path in &staging {
+        assert_eq!(
+            decode_reader(
+                &format(),
+                &mut Cursor::new(std::fs::read(path).unwrap()),
+                TEST_MAXIMUM,
+            )
+            .unwrap(),
+            b"new"
+        );
+    }
+    let recent = store
+        .cleanup_stale_temporary_files(Duration::from_secs(60 * 60))
+        .unwrap();
+    assert_eq!(recent.skipped.len(), expected_staging);
+    for path in &staging {
+        set_windows_modified(path, SystemTime::now() - Duration::from_secs(2 * 60 * 60));
+    }
+    let stale = store
+        .cleanup_stale_temporary_files(Duration::from_secs(60 * 60))
+        .unwrap();
+    assert_eq!(stale.removed.len(), expected_staging);
+    store.close().unwrap();
+}
+
+#[cfg(windows)]
 #[tokio::test]
 async fn windows_complete_save_failures_have_phase_justified_states() {
     let cases = [
@@ -1425,8 +1465,6 @@ async fn windows_complete_save_failures_have_phase_justified_states() {
         (TestStage::BeforeChecksumWrite, true, false),
         (TestStage::BeforeStagingFlush, true, true),
         (TestStage::BeforeCommit, true, true),
-        (TestStage::BeforeInitialMove, true, true),
-        (TestStage::BeforeReplacingMove, true, true),
     ];
     for (failed_stage, staging_exists, staging_is_complete) in cases {
         let root = test_directory();
@@ -1456,14 +1494,7 @@ async fn windows_complete_save_failures_have_phase_justified_states() {
                 .await
                 .unwrap();
         let error = store.save(b"key", b"new".to_vec()).await.unwrap_err();
-        if matches!(
-            failed_stage,
-            TestStage::BeforeInitialMove | TestStage::BeforeReplacingMove
-        ) {
-            assert!(matches!(error, AtomicBlobStoreError::AtomicCommit { .. }));
-        } else {
-            assert!(matches!(error, AtomicBlobStoreError::Io { .. }));
-        }
+        assert!(matches!(error, AtomicBlobStoreError::Io { .. }));
         assert_eq!(store.load(b"key").await.unwrap(), Some(b"old".to_vec()));
 
         let staging = windows_save_staging_files(&root.path().join("failure-state"));
@@ -1487,6 +1518,157 @@ async fn windows_complete_save_failures_have_phase_justified_states() {
 
 #[cfg(windows)]
 #[tokio::test]
+async fn windows_move_failures_are_injected_at_the_native_call_boundary() {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE, ERROR_SHARING_VIOLATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Destination {
+        Absent,
+        Present,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Effect {
+        None,
+        MoveThenError,
+    }
+
+    let cases = [
+        (
+            "initial-definite-access-denied",
+            Destination::Absent,
+            Effect::None,
+            ERROR_ACCESS_DENIED,
+            None,
+            true,
+        ),
+        (
+            "initial-ambiguous-moved",
+            Destination::Absent,
+            Effect::MoveThenError,
+            ERROR_GEN_FAILURE,
+            Some(&b"new"[..]),
+            false,
+        ),
+        (
+            "replace-definite-sharing",
+            Destination::Present,
+            Effect::None,
+            ERROR_SHARING_VIOLATION,
+            Some(&b"old"[..]),
+            true,
+        ),
+        (
+            "replace-definite-access-denied",
+            Destination::Present,
+            Effect::None,
+            ERROR_ACCESS_DENIED,
+            Some(&b"old"[..]),
+            true,
+        ),
+        (
+            "replace-ambiguous-unchanged",
+            Destination::Present,
+            Effect::None,
+            ERROR_GEN_FAILURE,
+            Some(&b"old"[..]),
+            true,
+        ),
+        (
+            "replace-ambiguous-moved",
+            Destination::Present,
+            Effect::MoveThenError,
+            ERROR_GEN_FAILURE,
+            Some(&b"new"[..]),
+            false,
+        ),
+    ];
+
+    for (name, expected_destination, effect, error_code, expected, staging_expected) in cases {
+        let root = test_directory();
+        if !qualify_contract_test(root.path(), name).unwrap() {
+            return;
+        }
+        if matches!(expected_destination, Destination::Present) {
+            let initial = AtomicBlobStore::open(root.path(), "move-error", options())
+                .await
+                .unwrap();
+            initial.save(b"key", b"old".to_vec()).await.unwrap();
+            initial.close().await.unwrap();
+        }
+
+        let operation = Arc::new(move |source: &Path, destination: &Path, flags: u32| {
+            let is_replacing = flags & MOVEFILE_REPLACE_EXISTING != 0;
+            let target_call = match expected_destination {
+                Destination::Absent => !is_replacing,
+                Destination::Present => is_replacing,
+            };
+            if !target_call {
+                return move_file(source, destination, flags);
+            }
+            if matches!(effect, Effect::MoveThenError) {
+                move_file(source, destination, flags)?;
+            }
+            Err(io::Error::from_raw_os_error(error_code as i32))
+        });
+        let store = AtomicBlobStore::open_with_test_windows_move(
+            root.path(),
+            "move-error",
+            options(),
+            operation,
+        )
+        .await
+        .unwrap();
+        let error = store.save(b"key", b"new".to_vec()).await.unwrap_err();
+        assert_eq!(windows_commit_raw_error(&error), Some(error_code as i32));
+        drop(store);
+
+        let fresh = AtomicBlobStore::open(root.path(), "move-error", options())
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.load(b"key").await.unwrap().as_deref(),
+            expected,
+            "{name}"
+        );
+        let namespace = root.path().join("move-error");
+        let staging = windows_save_staging_files(&namespace);
+        assert_eq!(staging.len(), usize::from(staging_expected), "{name}");
+        if let Some(staging) = staging.first() {
+            assert_eq!(
+                decode_reader(
+                    &format(),
+                    &mut Cursor::new(std::fs::read(staging).unwrap()),
+                    TEST_MAXIMUM,
+                )
+                .unwrap(),
+                b"new",
+                "{name}"
+            );
+            let recent = fresh
+                .cleanup_stale_temporary_files(Duration::from_secs(60 * 60))
+                .await
+                .unwrap();
+            assert_eq!(recent.skipped.len(), 1, "{name}");
+            set_windows_modified(
+                staging,
+                SystemTime::now() - Duration::from_secs(2 * 60 * 60),
+            );
+            let stale = fresh
+                .cleanup_stale_temporary_files(Duration::from_secs(60 * 60))
+                .await
+                .unwrap();
+            assert_eq!(stale.removed.len(), 1, "{name}");
+        }
+        fresh.close().await.unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn windows_streaming_save_failures_preserve_old_and_clean_or_own_staging() {
     for failed_stage in [
         TestStage::BeforeHeaderWrite,
@@ -1494,8 +1676,6 @@ async fn windows_streaming_save_failures_preserve_old_and_clean_or_own_staging()
         TestStage::BeforeChecksumWrite,
         TestStage::BeforeStagingFlush,
         TestStage::BeforeCommit,
-        TestStage::BeforeInitialMove,
-        TestStage::BeforeReplacingMove,
     ] {
         let root = test_directory();
         if !qualify_contract_test(
@@ -1533,6 +1713,207 @@ async fn windows_streaming_save_failures_preserve_old_and_clean_or_own_staging()
             assert!(staging.is_file());
         }
         store.close().await.unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_streaming_input_failure_state_matrix() {
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected blocking source failure"))
+        }
+    }
+
+    for facade in ["blocking", "tokio"] {
+        for failure in ["early-eof", "trailing", "source-io"] {
+            let root = test_directory();
+            let artifact = format!("stream-matrix-{facade}-{failure}");
+            if !qualify_contract_test(root.path(), &artifact).unwrap() {
+                return;
+            }
+            let namespace = format!("stream-{facade}-{failure}");
+            let initial =
+                BlockingAtomicBlobStore::open(root.path(), &namespace, options()).unwrap();
+            initial.save(b"key", b"old".to_vec()).unwrap();
+            initial.close().unwrap();
+
+            if facade == "blocking" {
+                let store =
+                    BlockingAtomicBlobStore::open(root.path(), &namespace, options()).unwrap();
+                let error = match failure {
+                    "early-eof" => store
+                        .save_from(b"key", &mut Cursor::new(b"new"), 4)
+                        .unwrap_err(),
+                    "trailing" => store
+                        .save_from(b"key", &mut Cursor::new(b"new!"), 3)
+                        .unwrap_err(),
+                    "source-io" => store.save_from(b"key", &mut FailingReader, 1).unwrap_err(),
+                    _ => unreachable!(),
+                };
+                assert!(match failure {
+                    "early-eof" => matches!(error, AtomicBlobStoreError::InputEndedEarly { .. }),
+                    "trailing" => {
+                        matches!(error, AtomicBlobStoreError::InputHasTrailingData { .. })
+                    }
+                    "source-io" => matches!(error, AtomicBlobStoreError::InputIo { .. }),
+                    _ => unreachable!(),
+                });
+                store.close().unwrap();
+            } else {
+                let store = AtomicBlobStore::open(root.path(), &namespace, options())
+                    .await
+                    .unwrap();
+                let error = match failure {
+                    "early-eof" => store
+                        .save_from(b"key", &mut Cursor::new(b"new"), 4)
+                        .await
+                        .unwrap_err(),
+                    "trailing" => store
+                        .save_from(b"key", &mut Cursor::new(b"new!"), 3)
+                        .await
+                        .unwrap_err(),
+                    "source-io" => store
+                        .save_from(b"key", &mut FailingAsyncReader, 1)
+                        .await
+                        .unwrap_err(),
+                    _ => unreachable!(),
+                };
+                assert!(match failure {
+                    "early-eof" => matches!(error, AtomicBlobStoreError::InputEndedEarly { .. }),
+                    "trailing" => {
+                        matches!(error, AtomicBlobStoreError::InputHasTrailingData { .. })
+                    }
+                    "source-io" => matches!(error, AtomicBlobStoreError::InputIo { .. }),
+                    _ => unreachable!(),
+                });
+                store.close().await.unwrap();
+            }
+            assert_windows_stream_failure_state(root.path(), &namespace, b"old", 0);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_streaming_cancellation_and_commit_boundary_matrix() {
+    {
+        let root = test_directory();
+        if !qualify_contract_test(root.path(), "stream-cancel-during-write").unwrap() {
+            return;
+        }
+        let namespace = "stream-cancel-during-write";
+        let initial = AtomicBlobStore::open(root.path(), namespace, options())
+            .await
+            .unwrap();
+        initial.save(b"key", b"old".to_vec()).await.unwrap();
+        initial.close().await.unwrap();
+        let (reached_sender, reached_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = std::sync::Mutex::new(release_receiver);
+        let hook = Arc::new(move |stage| {
+            if stage == TestStage::DuringWrite {
+                reached_sender.send(()).unwrap();
+                release_receiver.lock().unwrap().recv().unwrap();
+            }
+            Ok(())
+        });
+        let store = AtomicBlobStore::open_with_test_hook(root.path(), namespace, options(), hook)
+            .await
+            .unwrap();
+        let (mut source_writer, mut source_reader) = tokio::io::duplex(1);
+        tokio::io::AsyncWriteExt::write_all(&mut source_writer, b"n")
+            .await
+            .unwrap();
+        let streaming = store.clone();
+        let task =
+            tokio::spawn(async move { streaming.save_from(b"key", &mut source_reader, 2).await });
+        tokio::task::spawn_blocking(move || reached_receiver.recv().unwrap())
+            .await
+            .unwrap();
+        task.abort();
+        release_sender.send(()).unwrap();
+        assert!(task.await.unwrap_err().is_cancelled());
+        store.flush().await.unwrap();
+        store.close().await.unwrap();
+        assert_windows_stream_failure_state(root.path(), namespace, b"old", 0);
+    }
+
+    {
+        let root = test_directory();
+        if !qualify_contract_test(root.path(), "stream-cancel-after-complete").unwrap() {
+            return;
+        }
+        let namespace = "stream-cancel-after-complete";
+        let initial = AtomicBlobStore::open(root.path(), namespace, options())
+            .await
+            .unwrap();
+        initial.save(b"key", b"old".to_vec()).await.unwrap();
+        initial.close().await.unwrap();
+        let (reached_sender, reached_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = std::sync::Mutex::new(release_receiver);
+        let hook = Arc::new(move |stage| {
+            if stage == TestStage::BeforeCommit {
+                reached_sender.send(()).unwrap();
+                release_receiver.lock().unwrap().recv().unwrap();
+            }
+            Ok(())
+        });
+        let store = AtomicBlobStore::open_with_test_hook(root.path(), namespace, options(), hook)
+            .await
+            .unwrap();
+        let streaming = store.clone();
+        let task = tokio::spawn(async move {
+            streaming
+                .save_from(b"key", &mut Cursor::new(b"new"), 3)
+                .await
+        });
+        tokio::task::spawn_blocking(move || reached_receiver.recv().unwrap())
+            .await
+            .unwrap();
+        task.abort();
+        release_sender.send(()).unwrap();
+        assert!(task.await.unwrap_err().is_cancelled());
+        store.flush().await.unwrap();
+        store.close().await.unwrap();
+        assert_windows_stream_failure_state(root.path(), namespace, b"new", 0);
+    }
+
+    {
+        let root = test_directory();
+        if !qualify_contract_test(root.path(), "stream-failure-before-commit").unwrap() {
+            return;
+        }
+        let namespace = "stream-failure-before-commit";
+        let initial = AtomicBlobStore::open(root.path(), namespace, options())
+            .await
+            .unwrap();
+        initial.save(b"key", b"old".to_vec()).await.unwrap();
+        initial.close().await.unwrap();
+        let hook = Arc::new(|stage| {
+            if stage == TestStage::BeforeCommit {
+                Err(io::Error::other(
+                    "injected failure immediately before commit",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        let store = AtomicBlobStore::open_with_test_hook(root.path(), namespace, options(), hook)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.save_from(b"key", &mut Cursor::new(b"new"), 3).await,
+            Err(AtomicBlobStoreError::Io {
+                operation: StoreOperation::WriteEnvelope,
+                ..
+            })
+        ));
+        store.close().await.unwrap();
+        assert_windows_stream_failure_state(root.path(), namespace, b"old", 1);
     }
 }
 
@@ -1722,24 +2103,51 @@ async fn windows_independent_stores_are_valid_but_have_no_ordering_contract() {
 }
 
 #[cfg(windows)]
-#[tokio::test]
-async fn windows_external_writer_is_an_explicit_negative_contract_case() {
+#[test]
+fn windows_external_writer_is_a_bounded_concurrent_negative_contract_case() {
     let root = test_directory();
-    let store = AtomicBlobStore::open(root.path(), "external-writer", options())
-        .await
-        .unwrap();
-    store.save(b"key", b"valid".to_vec()).await.unwrap();
-    std::fs::write(
-        store.blob_path(b"key"),
-        b"external writer bypassed the store",
-    )
-    .unwrap();
-    assert!(store.load(b"key").await.is_err());
-    assert_eq!(
-        std::fs::read(store.blob_path(b"key")).unwrap(),
-        b"external writer bypassed the store"
-    );
-    store.close().await.unwrap();
+    if !qualify_contract_test(root.path(), "external-writer-negative-contract").unwrap() {
+        return;
+    }
+    let left = BlockingAtomicBlobStore::open(root.path(), "external-writer", options()).unwrap();
+    let right = BlockingAtomicBlobStore::open(root.path(), "external-writer", options()).unwrap();
+    let canonical = left.blob_path(b"key");
+    left.save(b"key", b"initial".to_vec()).unwrap();
+
+    for iteration in 0_u8..64 {
+        let left_payload = vec![b'L', iteration];
+        let right_payload = vec![b'R', iteration];
+        let external = vec![b'X'; 4 * 1024 + usize::from(iteration)];
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = left.save(b"key", left_payload.clone());
+            });
+            scope.spawn(|| {
+                let _ = right.save(b"key", right_payload.clone());
+            });
+            scope.spawn(|| {
+                let _ = std::fs::write(&canonical, &external);
+            });
+
+            for _ in 0..8 {
+                let Ok(bytes) = std::fs::read(&canonical) else {
+                    continue;
+                };
+                if external.starts_with(&bytes) {
+                    continue;
+                }
+                let payload = decode_reader(&format(), &mut Cursor::new(bytes), TEST_MAXIMUM)
+                    .expect("every observed store-produced candidate is a complete envelope");
+                assert!(
+                    payload == b"initial"
+                        || matches!(payload.as_slice(), [b'L' | b'R', observed] if *observed <= iteration),
+                    "store-produced envelope contained an unexpected payload"
+                );
+            }
+        });
+    }
+    left.close().unwrap();
+    right.close().unwrap();
 }
 
 #[cfg(windows)]
@@ -1751,9 +2159,39 @@ fn windows_mapping_and_image_handle_behavior_is_characterized() {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
-    use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READONLY, SEC_IMAGE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+        PAGE_READONLY, SEC_IMAGE, UnmapViewOfFile,
+    };
 
-    fn mapping(file: &std::fs::File, protection: u32) -> io::Result<OwnedHandle> {
+    struct MappingView {
+        _mapping: OwnedHandle,
+        view: MEMORY_MAPPED_VIEW_ADDRESS,
+    }
+
+    impl std::fmt::Debug for MappingView {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("MappingView(mapped)")
+        }
+    }
+
+    impl MappingView {
+        fn bytes(&self, length: usize) -> &[u8] {
+            // SAFETY: the view remains mapped for `self`'s lifetime and the caller uses the
+            // exact size of the backing file captured before replacement.
+            unsafe { std::slice::from_raw_parts(self.view.Value.cast(), length) }
+        }
+    }
+
+    impl Drop for MappingView {
+        fn drop(&mut self) {
+            // SAFETY: `view` is the successful result of one MapViewOfFile call and is unmapped
+            // exactly once here before the mapping handle is closed.
+            let _ = unsafe { UnmapViewOfFile(self.view) };
+        }
+    }
+
+    fn mapping(file: &std::fs::File, protection: u32) -> io::Result<MappingView> {
         // SAFETY: the source handle remains live for the call and the unnamed mapping has no
         // security-attribute or name pointers to retain.
         let handle = unsafe {
@@ -1770,7 +2208,18 @@ fn windows_mapping_and_image_handle_behavior_is_characterized() {
             Err(io::Error::last_os_error())
         } else {
             // SAFETY: the mapping handle is uniquely owned and CloseHandle-compatible.
-            Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+            let mapping = unsafe { OwnedHandle::from_raw_handle(handle) };
+            // SAFETY: the mapping handle is live and FILE_MAP_READ is valid for both the
+            // read-only data mapping and SEC_IMAGE mapping used by this test.
+            let view = unsafe { MapViewOfFile(mapping.as_raw_handle(), FILE_MAP_READ, 0, 0, 0) };
+            if view.Value.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(MappingView {
+                    _mapping: mapping,
+                    view,
+                })
+            }
         }
     }
 
@@ -1786,7 +2235,8 @@ fn windows_mapping_and_image_handle_behavior_is_characterized() {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(&canonical)
         .unwrap();
-    let _mapping = mapping(&file, PAGE_READONLY).unwrap();
+    let mapped_length = usize::try_from(file.metadata().unwrap().len()).unwrap();
+    let data_mapping = mapping(&file, PAGE_READONLY).unwrap();
     let data_result = store.save(b"key", b"new".to_vec());
     if let Err(error) = &data_result {
         assert!(matches!(
@@ -1794,6 +2244,19 @@ fn windows_mapping_and_image_handle_behavior_is_characterized() {
             Some(code) if code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_ACCESS_DENIED as i32
         ));
     }
+    assert_eq!(
+        decode_reader(
+            &format(),
+            &mut Cursor::new(data_mapping.bytes(mapped_length)),
+            TEST_MAXIMUM,
+        )
+        .unwrap(),
+        b"old"
+    );
+    if data_result.is_ok() {
+        assert_eq!(store.load(b"key").unwrap(), Some(b"new".to_vec()));
+    }
+    drop(data_mapping);
     drop(file);
     store.close().unwrap();
 
@@ -2602,6 +3065,12 @@ fn windows_randomized_replacement_stress_exposes_only_complete_candidates() {
         std::fs::write(destination.join("reproduction.txt"), manifest).unwrap();
         std::fs::write(destination.join("child.stdout.log"), stdout).unwrap();
         std::fs::write(destination.join("child.stderr.log"), stderr).unwrap();
+        let environment = artifact_root
+            .join("environments")
+            .join(format!("stress-{campaign}.txt"));
+        if environment.is_file() {
+            std::fs::copy(environment, destination.join("environment.txt")).unwrap();
+        }
         let namespace = root.join("stress");
         if namespace.is_dir() {
             for entry in std::fs::read_dir(namespace).unwrap().filter_map(Result::ok) {
@@ -2776,6 +3245,7 @@ fn windows_randomized_replacement_stress_exposes_only_complete_candidates() {
             writeln!(manifest, "facade={facade}").unwrap();
             writeln!(manifest, "first_iteration={first_iteration}").unwrap();
             writeln!(manifest, "child_status={status}").unwrap();
+            writeln!(manifest, "kill_requested={killed}").unwrap();
             writeln!(manifest, "begun={begun:?}").unwrap();
             writeln!(manifest, "committed={committed:?}").unwrap();
             writeln!(manifest, "canonical={canonical:?}").unwrap();

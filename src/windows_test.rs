@@ -226,7 +226,12 @@ fn path_uses_remote_protocol(path: &Path) -> io::Result<bool> {
     }
     // SAFETY: the successful call returned one owned handle.
     let _file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let mut protocol = FILE_REMOTE_PROTOCOL_INFO::default();
+    let mut protocol = FILE_REMOTE_PROTOCOL_INFO {
+        StructureVersion: 2,
+        StructureSize: u16::try_from(size_of::<FILE_REMOTE_PROTOCOL_INFO>())
+            .expect("FILE_REMOTE_PROTOCOL_INFO size fits in u16"),
+        ..FILE_REMOTE_PROTOCOL_INFO::default()
+    };
     // SAFETY: the handle is live and the output buffer has the exact advertised size.
     let result = unsafe {
         GetFileInformationByHandleEx(

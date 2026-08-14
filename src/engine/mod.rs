@@ -170,10 +170,16 @@ pub struct StoreConfig {
     pub(crate) max_concurrent_operations: usize,
     #[cfg(all(test, any(unix, windows)))]
     pub(crate) hook: Option<Arc<dyn Fn(TestStage) -> io::Result<()> + Send + Sync>>,
+    #[cfg(all(test, windows))]
+    pub(crate) windows_move: Option<WindowsMoveOperation>,
     #[cfg(feature = "bench-instrumentation")]
     pub(crate) benchmark_events:
         Option<std::sync::mpsc::Sender<crate::bench_instrumentation::BenchmarkEvent>>,
 }
+
+#[cfg(all(test, windows))]
+pub(crate) type WindowsMoveOperation =
+    Arc<dyn Fn(&Path, &Path, u32) -> io::Result<()> + Send + Sync>;
 
 impl std::fmt::Debug for StoreConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -330,6 +336,25 @@ impl EngineHandle {
         let mut config =
             initialize_platform(root, namespace, format, maximum, max_concurrent_operations)?;
         config.hook = Some(hook);
+        Self::from_config(config)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn open_with_test_windows_move(
+        root: impl Into<PathBuf>,
+        namespace: impl AsRef<OsStr>,
+        options: AtomicBlobStoreOptions,
+        windows_move: WindowsMoveOperation,
+    ) -> Result<Self, AtomicBlobStoreError> {
+        let root = root.into();
+        let namespace = validate_namespace(namespace.as_ref())?;
+        validate_maximum(options.max_blob_size)?;
+        let maximum = options.max_blob_size;
+        let format = options.format;
+        let max_concurrent_operations = options.max_concurrent_operations.get();
+        let mut config =
+            initialize_platform(root, namespace, format, maximum, max_concurrent_operations)?;
+        config.windows_move = Some(windows_move);
         Self::from_config(config)
     }
 
@@ -845,8 +870,6 @@ pub(crate) enum TestStage {
     DuringWrite,
     BeforeStagingFlush,
     BeforeCommit,
-    BeforeInitialMove,
-    BeforeReplacingMove,
     CommitError,
     AfterCommit,
     BeforeRemove,

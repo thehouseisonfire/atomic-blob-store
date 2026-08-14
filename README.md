@@ -134,9 +134,10 @@ names are never parsed or cleaned by this crate. Windows uses exclusive
 same-directory staging files, `FlushFileBuffers`, and native write-through
 moves; its explicit cleanup recognizes only names owned by the configured
 suffix and store format. Native Windows CI exercises failure boundaries,
-randomized process termination during repeated replacement, open-handle
-behavior, extended and non-Unicode paths where the hosted filesystem permits
-them, both facades, and independently extracted package consumers. See
+randomized process termination during repeated replacement, active data and
+executable-image mapping views, unsupported concurrent writers, extended and
+non-Unicode paths where the hosted filesystem permits them, both facades, and
+independently extracted package consumers. See
 [TODO.md](TODO.md) for the evidence runbook and per-release qualification
 record.
 
