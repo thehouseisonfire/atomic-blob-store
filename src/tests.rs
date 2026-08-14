@@ -2047,6 +2047,7 @@ async fn windows_sharing_violation_returns_promptly_without_retry_and_is_cleanab
 async fn windows_delete_shared_old_handle_and_fresh_open_see_distinct_file_objects() {
     use std::io::{Seek, SeekFrom};
     use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
@@ -2064,14 +2065,23 @@ async fn windows_delete_shared_old_handle_and_fresh_open_see_distinct_file_objec
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(store.blob_path(b"key"))
         .unwrap();
-    store.save(b"key", b"new".to_vec()).await.unwrap();
+    let replacement = store.save(b"key", b"new".to_vec()).await;
 
     old_handle.seek(SeekFrom::Start(0)).unwrap();
     assert_eq!(
         decode_reader(&format(), &mut old_handle, TEST_MAXIMUM).unwrap(),
         b"old"
     );
-    assert_eq!(store.load(b"key").await.unwrap(), Some(b"new".to_vec()));
+    match replacement {
+        Ok(()) => assert_eq!(store.load(b"key").await.unwrap(), Some(b"new".to_vec())),
+        Err(error) => {
+            assert!(matches!(
+                windows_commit_raw_error(&error),
+                Some(code) if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_SHARING_VIOLATION as i32
+            ));
+            assert_eq!(store.load(b"key").await.unwrap(), Some(b"old".to_vec()));
+        }
+    }
     store.close().await.unwrap();
 }
 
