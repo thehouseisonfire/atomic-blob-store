@@ -159,7 +159,7 @@ jobs:
         timeout-minutes: 150
         env:
           ATOMIC_BLOB_WINDOWS_STRESS_ATTEMPTS: ${{ github.event_name == 'workflow_dispatch' && inputs.soak && matrix.runner == 'windows-2022' && '10000' || '2000' }}
-          ATOMIC_BLOB_WINDOWS_STRESS_SEED: 6840335469060923678
+          ATOMIC_BLOB_WINDOWS_STRESS_SEED: '6840335469060923678'
         run: |
           set -euo pipefail
           log="windows-validation/replacement-stress.log"
